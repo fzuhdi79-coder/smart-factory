@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SF·ITP — Smart Factory Industrial Telemetry</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getDatabase, ref, onValue, set } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
+
+const firebaseConfig = {
+  apiKey:"AIzaSyDUdFRvJpeTz2pt7sYl7VaCgG8YWI_m9sQ",
+  authDomain:"smart-factory-a05f3.firebaseapp.com",
+  projectId:"smart-factory-a05f3",
+  storageBucket:"smart-factory-a05f3.firebasestorage.app",
+  messagingSenderId:"895882490392",
+  appId:"1:895882490392:web:cc0ac95af48444dc25896d",
+  databaseURL:"https://smart-factory-a05f3-default-rtdb.asia-southeast1.firebasedatabase.app/"
+};
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+const THR = {
+  suhu:    {warn:38, danger:42},
+  gas:     {warn:250,danger:300},
+  getaran: {warn:2.0,danger:3.0},
+  arus:    {warn:4.0,danger:5.0},
+};
+
+function getSt(key, val) {
+  const t = THR[key];
+  if (!t || val==null) return 'ok';
+  if (val >= t.danger) return 'crit';
+  if (val >= t.warn)   return 'warn';
+  return 'ok';
+}
+
+window.__sf = { latest:null, hist:[], alarms:[], cN1:null, cN2:null, db };
+
+/* ── LISTENER ─────────────────────────────────────────────── */
+onValue(ref(db,'factory_data'), snap => {
+  const raw = snap.val(); let flat = [];
+  if (raw) {
+    for (const tgl in raw) for (const jam in raw[tgl]) {
+      const e = raw[tgl][jam];
+      const d = {
+        id: `${tgl}_${jam}`,
+        ts: e.waktu_lengkap || `${tgl} ${jam.replace(/_/g,':')}`,
+        time: new Date((e.waktu_lengkap||'').replace(/-/g,'/')||Date.now()),
+        getaran:  e.node_machine?.getaran  || 0,
+        arus:     e.node_machine?.arus      || 0,
+        suhu_n1:  e.node_machine?.suhu      || 0,
+        suhu_n2:  e.node_environment?.suhu  || e.node_machine?.suhu || 0,
+        hum:      e.node_environment?.humidity || 0,
+        gas:      e.node_environment?.gas   || 0,
+        anom_mach:  e.node_machine?.anomali       || false,
+        leak_env:   e.node_environment?.kebocoran || false,
+      };
+      let st = 'ok';
+      if (d.anom_mach || d.leak_env) st = 'crit';
+      else if (getSt('suhu',d.suhu_n2)==='warn' || getSt('gas',d.gas)==='warn') st='warn';
+      d.status = st;
+      flat.push(d);
+    }
+  }
+  flat.sort((a,b)=>b.time-a.time);
+  const hist  = flat.slice(0,30);
+  const alarms = flat.filter(d=>d.status!=='ok').slice(0,50);
+  window.__sf.hist   = hist;
+  window.__sf.alarms = alarms;
+  if (hist.length) { window.__sf.latest=hist[0]; renderDash(hist[0]); updateSB(hist[0]); }
+  renderLog(hist);
+  renderAlarms(alarms);
+  updateCharts(hist.slice().reverse());
+}, err => sbState('conn-err','KONEKSI GAGAL — '+err.message));
+
+/* ── DASHBOARD ───────────────────────────────────────────── */
+function renderDash(d) {
+  setCard('c-getaran', d.getaran, 'mm/s', getSt('getaran',d.getaran));
+  setCard('c-arus',    d.arus,    'A',    getSt('arus',d.arus));
+  setCard('c-suhu-n1', d.suhu_n1, '°C',  getSt('suhu',d.suhu_n1));
+  setCard('c-suhu',    d.suhu_n2, '°C',  getSt('suhu',d.suhu_n2));
+  setCard('c-gas',     d.gas,     'ppm', getSt('gas',d.gas));
+  setCard('c-hum',     d.hum,     '%',   'ok');
+
+  dot('dot-n1', d.anom_mach ? 'crit':'ok');
+  dot('dot-n2', d.leak_env  ? 'crit':'ok');
+  dot('dot-n3', 'ok');
+
+  const banner = document.getElementById('banner');
+  if (d.status !== 'ok') {
+    const msgs = [];
+    if (d.leak_env)   msgs.push('Kebocoran gas terdeteksi — Node 2');
+    if (d.anom_mach)  msgs.push('Anomali mesin terdeteksi — Node 1');
+    if (!msgs.length) msgs.push('Parameter sensor mendekati batas bahaya');
+    document.getElementById('banner-text').textContent = msgs.join('  ·  ');
+    banner.className = `banner bn-${d.status}`;
+    banner.style.display = 'flex';
+  } else { banner.style.display = 'none'; }
+
+  document.getElementById('db-id').textContent     = d.id;
+  document.getElementById('db-status').textContent = d.status === 'ok' ? 'NORMAL' : d.status === 'warn' ? 'WARNING' : 'ANOMALI';
+  document.getElementById('db-status').className   = `db-val st-${d.status}`;
+  document.getElementById('db-ts').textContent     = d.ts;
+  document.getElementById('hdr-ts').textContent    = new Date().toLocaleTimeString('id-ID');
+}
+
+function setCard(id, val, unit, st) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.querySelector('.cv').textContent = val!=null ? parseFloat(val).toFixed(2) : '—';
+  el.querySelector('.cu').textContent = unit;
+  const stLabels = {ok:'NORMAL',warn:'WARNING',crit:'ANOMALI'};
+  const badge = el.querySelector('.cb');
+  if (badge) { badge.textContent=stLabels[st]||'NORMAL'; badge.className=`cb st-badge-${st}`; }
+  el.className = `kpi-card kc-${st}`;
+}
+
+function dot(id, st) {
+  const el = document.getElementById(id);
+  if (el) el.className = `sdot sd-${st}`;
+}
+
+/* ── CHARTS ──────────────────────────────────────────────── */
+function mkChart(id, datasets) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return null;
+  return new Chart(ctx, {
+    type:'line', data:{ labels:[], datasets },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      animation:{ duration:300 },
+      interaction:{ mode:'index', intersect:false },
+      plugins:{
+        legend:{ display:true, labels:{ color:'#4a5c6e', font:{size:10,family:'JetBrains Mono'}, usePointStyle:true, pointStyleWidth:6, boxHeight:6 }},
+        tooltip:{ backgroundColor:'#0a0e13', borderColor:'#1c2b3a', borderWidth:1, titleColor:'#8a9db5', bodyColor:'#c8d4e0', padding:10, titleFont:{family:'JetBrains Mono',size:10}, bodyFont:{size:11} }
+      },
+      scales:{
+        x:{ ticks:{ color:'#2e3e4e', font:{size:9,family:'JetBrains Mono'}, maxTicksLimit:6 }, grid:{ color:'rgba(28,43,58,0.5)' }, border:{ color:'#1c2b3a' }},
+        y:{ ticks:{ color:'#2e3e4e', font:{size:9,family:'JetBrains Mono'} }, grid:{ color:'rgba(28,43,58,0.5)' }, border:{ color:'#1c2b3a' }}
+      }
+    }
+  });
+}
+
+function ds(label, color, data=[]) {
+  return { label, data, borderColor:color, backgroundColor:color+'14', borderWidth:1.5, tension:0.35, fill:true, pointRadius:1.5, pointHoverRadius:4, pointBackgroundColor:color };
+}
+
+// Init charts once
+let chartN1, chartN2;
+window.addEventListener('DOMContentLoaded', () => {
+  chartN1 = mkChart('chart-n1',[
+    ds('Getaran (mm/s)','#38bdf8'),
+    ds('Arus (A)',      '#818cf8'),
+    ds('Suhu N1 (°C)', '#34d399'),
+  ]);
+  chartN2 = mkChart('chart-n2',[
+    ds('Suhu (°C)',     '#fb923c'),
+    ds('Gas ÷10 (ppm)','#f43f5e'),
+    ds('Kelembaban (%)', '#a78bfa'),
+  ]);
+  window.__sf.cN1 = chartN1;
+  window.__sf.cN2 = chartN2;
+});
+
+function updateCharts(docs) {
+  if (!docs.length) return;
+  const labels = docs.map(d => {
+    const dt = new Date(d.time);
+    return isNaN(dt) ? d.id?.split('_')[1]||'' : dt.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  });
+
+  const c1 = window.__sf.cN1;
+  if (c1) {
+    c1.data.labels            = labels;
+    c1.data.datasets[0].data  = docs.map(d=>d.getaran??0);
+    c1.data.datasets[1].data  = docs.map(d=>d.arus??0);
+    c1.data.datasets[2].data  = docs.map(d=>d.suhu_n1??0);
+    c1.update('none');
+  }
+
+  const c2 = window.__sf.cN2;
+  if (c2) {
+    c2.data.labels            = labels;
+    c2.data.datasets[0].data  = docs.map(d=>d.suhu_n2??0);
+    c2.data.datasets[1].data  = docs.map(d=>(d.gas??0)/10);
+    c2.data.datasets[2].data  = docs.map(d=>d.hum??0);
+    c2.update('none');
+  }
+}
+
+/* ── LOG ─────────────────────────────────────────────────── */
+function renderLog(docs) {
+  const tb = document.getElementById('log-tbody');
+  if (!tb) return;
+  tb.innerHTML = docs.map(d=>`<tr>
+    <td class="mc">${d.ts}</td>
+    <td>${fv(d.getaran,'mm/s')}</td>
+    <td>${fv(d.arus,'A')}</td>
+    <td>${fv(d.suhu_n1,'°C')}</td>
+    <td>${fv(d.suhu_n2,'°C')}</td>
+    <td>${fv(d.gas,'ppm')}</td>
+    <td>${fv(d.hum,'%')}</td>
+    <td><span class="lpill lp-${d.status}">${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'}</span></td>
+  </tr>`).join('');
+  document.getElementById('log-count').textContent = docs.length+' entri';
+}
+
+/* ── ALARMS ──────────────────────────────────────────────── */
+function renderAlarms(docs) {
+  const el = document.getElementById('alarm-list');
+  if (!el) return;
+  const nc = docs.filter(d=>d.status==='crit').length;
+  const nw = docs.filter(d=>d.status==='warn').length;
+  document.getElementById('s-crit').textContent  = nc;
+  document.getElementById('s-warn').textContent  = nw;
+  document.getElementById('s-total').textContent = docs.length;
+  const nb = document.getElementById('alarm-badge');
+  if (nb) { nb.textContent=docs.length; nb.style.display=docs.length?'inline-flex':'none'; }
+  if (!docs.length) {
+    el.innerHTML=`<div class="empty-st"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg><p>Semua sistem berjalan normal</p></div>`;
+    return;
+  }
+  el.innerHTML = docs.map(d=>{
+    const tg=[];
+    if(d.leak_env)   tg.push('Kebocoran Gas');
+    if(d.anom_mach)  tg.push('Anomali Mesin');
+    if(d.suhu_n2>38) tg.push(`Suhu ${parseFloat(d.suhu_n2).toFixed(1)}°C`);
+    if(d.gas>250)    tg.push(`Gas ${parseFloat(d.gas).toFixed(0)} ppm`);
+    return `<div class="alarm-row ar-${d.status}">
+      <div class="ar-left">
+        <span class="ar-badge arb-${d.status}">${d.status==='crit'?'ANOMALI':'WARNING'}</span>
+        <span class="ar-tags">${tg.map(t=>`<span>${t}</span>`).join('')}</span>
+      </div>
+      <span class="ar-ts mc">${d.ts}</span>
+    </div>`;
+  }).join('');
+}
+
+/* ── STATUS BAR ──────────────────────────────────────────── */
+function updateSB(d) {
+  sbState(d.status, `LIVE · RTDB · ${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'} · ${d.ts}`);
+}
+function sbState(st, msg) {
+  const bar=document.getElementById('sb'); const txt=document.getElementById('sb-txt');
+  if(bar) bar.className=`sb sb-${st}`;
+  if(txt) txt.textContent=msg;
+}
+
+/* ── TEST INSERT ─────────────────────────────────────────── */
+const PRESETS = [
+  {label:'Normal',      data:{getaran:1.8,arus:3.2,suhu:35,hum:72,gas:180,am:false,ke:false}},
+  {label:'Warning Suhu',data:{getaran:2.1,arus:3.5,suhu:40,hum:65,gas:260,am:false,ke:false}},
+  {label:'Anomali Gas', data:{getaran:2.4,arus:3.7,suhu:41,hum:68,gas:318,am:false,ke:true }},
+  {label:'Full Anomali',data:{getaran:3.5,arus:5.2,suhu:50,hum:90,gas:420,am:true, ke:true }},
+];
+function pathNow() {
+  const n=new Date(), tgl=n.toISOString().split('T')[0];
+  const jam=n.toTimeString().split(' ')[0].replace(/:/g,'_');
+  return {tgl,jam,full:`${tgl} ${n.toTimeString().split(' ')[0]}`};
+}
+window.sendPreset = async i => {
+  const p=PRESETS[i].data, t=pathNow();
+  try {
+    await set(ref(db,`factory_data/${t.tgl}/${t.jam}`),{
+      waktu_lengkap:t.full,
+      node_machine:{anomali:p.am,arus:p.arus,getaran:p.getaran,suhu:p.suhu},
+      node_environment:{gas:p.gas,humidity:p.hum,kebocoran:p.ke,suhu:p.suhu}
+    });
+    toast(`Preset "${PRESETS[i].label}" dikirim`);
+  } catch(e){toast(e.message,true);}
+};
+window.sendCustom = async () => {
+  const g=id=>parseFloat(document.getElementById(id)?.value||'0'), t=pathNow();
+  const gas=g('i-gas'), suhu=g('i-suhu');
+  try {
+    await set(ref(db,`factory_data/${t.tgl}/${t.jam}`),{
+      waktu_lengkap:t.full,
+      node_machine:{anomali:false,arus:g('i-arus'),getaran:g('i-getaran'),suhu},
+      node_environment:{gas,humidity:g('i-hum'),kebocoran:(gas>300),suhu}
+    });
+    toast('Data custom berhasil dikirim');
+  } catch(e){toast(e.message,true);}
+};
+
+/* ── HELPERS ─────────────────────────────────────────────── */
+function fv(v,u) {
+  if(v==null) return `<span class="dim">—</span>`;
+  return `<span class="dn">${parseFloat(v).toFixed(2)}</span><span class="du"> ${u}</span>`;
+}
+function toast(msg,err=false) {
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.className=`toast ${err?'t-err':'t-ok'}`;
+  t.style.opacity='1'; t.style.transform='translateY(0)';
+  setTimeout(()=>{t.style.opacity='0';t.style.transform='translateY(10px)'},3000);
+}
+</script>
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root {
+  --bg:      #07090d;
+  --bg-s:    #05070a;
+  --bg-c:    #0b0f15;
+  --bg-h:    #0f151d;
+  --b1:      #151f2b;
+  --b2:      #1c2a38;
+  --b3:      #243040;
+
+  --t1: #dce8f0;
+  --t2: #7a8fa5;
+  --t3: #3d5060;
+  --t4: #1e2e3c;
+
+  --cyan:   #29a9e0;
+  --indigo: #7069d4;
+  --green:  #27b37a;
+  --amber:  #e0a020;
+  --rose:   #d93a52;
+  --violet: #8b5cf6;
+  --sage:   #5eaa8a;
+
+  --ok-bg:   #030d08; --ok-br:   #0a2518; --ok-tx:   #27b37a;
+  --warn-bg: #0d0900; --warn-br: #281a00; --warn-tx: #e0a020;
+  --crit-bg: #0d0208; --crit-br: #2a0515; --crit-tx: #d93a52;
+
+  --font: 'Inter', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+
+  --nav: 220px;
+  --sbh: 32px;
+  --r: 8px;
+}
+
+html{font-size:14px}
+body{font-family:var(--font);background:var(--bg);color:var(--t1);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
+
+::-webkit-scrollbar{width:3px;height:3px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--b2);border-radius:9px}
+
+/* ── STATUS BAR ─────────────────────────────────────── */
+.sb {
+  position:sticky;top:0;z-index:300;height:var(--sbh);
+  display:flex;align-items:center;gap:8px;
+  padding:0 16px;font-family:var(--mono);font-size:9px;
+  letter-spacing:1.4px;border-bottom:1px solid var(--b1);
+  transition:background .3s,color .3s;
+}
+.sb-ok   {background:var(--ok-bg);  border-color:var(--ok-br);  color:var(--ok-tx);}
+.sb-warn {background:var(--warn-bg);border-color:var(--warn-br);color:var(--warn-tx);}
+.sb-crit {background:var(--crit-bg);border-color:var(--crit-br);color:var(--crit-tx);animation:bk .7s infinite;}
+.sb-conn-err{background:#080808;border-color:#200a10;color:var(--rose);}
+
+.sb-dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex-shrink:0;animation:pd 1.8s ease-in-out infinite}
+@keyframes pd{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.8);opacity:.5}}
+@keyframes bk{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── LAYOUT ──────────────────────────────────────────── */
+.shell{display:flex;height:calc(100vh - var(--sbh))}
+
+/* ── SIDEBAR ─────────────────────────────────────────── */
+.side{
+  width:var(--nav);flex-shrink:0;
+  background:var(--bg-s);border-right:1px solid var(--b1);
+  display:flex;flex-direction:column;
+  position:sticky;top:var(--sbh);height:calc(100vh - var(--sbh));
+  overflow-y:auto;
+}
+
+.side-brand{padding:16px;border-bottom:1px solid var(--b1);}
+.brand-row{display:flex;align-items:center;gap:9px;margin-bottom:5px;}
+.brand-sq{
+  width:26px;height:26px;border-radius:6px;flex-shrink:0;
+  background:linear-gradient(145deg,#0e2235,#081520);
+  border:1px solid var(--b2);
+  display:flex;align-items:center;justify-content:center;
+}
+.brand-sq svg{display:block;}
+.brand-name{font-size:12px;font-weight:600;color:var(--t1);letter-spacing:-.3px;}
+.brand-id{font-size:8px;color:var(--t4);font-family:var(--mono);letter-spacing:.8px;text-transform:uppercase;}
+
+.nav-grp{padding:12px 0 0;}
+.nav-grp-label{padding:0 14px 5px;font-size:8px;color:var(--t4);letter-spacing:1.5px;text-transform:uppercase;font-weight:500;}
+
+.nb{
+  display:flex;align-items:center;gap:8px;
+  padding:7px 14px;width:100%;text-align:left;
+  background:transparent;border:none;border-left:2px solid transparent;
+  cursor:pointer;font-family:var(--font);font-size:11px;color:var(--t2);
+  transition:all .12s;
+}
+.nb:hover{color:var(--t1);background:var(--bg-h);}
+.nb.on{color:var(--cyan);background:rgba(41,169,224,.05);border-left-color:var(--cyan);}
+.nb-ico{width:14px;height:14px;flex-shrink:0;opacity:.7;}
+.nb.on .nb-ico{opacity:1;}
+
+.n-badge{
+  display:none;margin-left:auto;
+  background:rgba(217,58,82,.12);color:var(--rose);
+  border:1px solid rgba(217,58,82,.25);
+  font-size:8px;font-family:var(--mono);padding:1px 5px;border-radius:4px;
+}
+
+/* Node dots in sidebar */
+.side-nodes{padding:8px 14px;}
+.sn-row{display:flex;align-items:center;gap:8px;padding:4px 0;}
+.sdot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
+.sd-ok  {background:var(--green);box-shadow:0 0 5px rgba(39,179,122,.4);animation:pd 2.2s ease-in-out infinite;}
+.sd-crit{background:var(--rose); box-shadow:0 0 5px rgba(217,58,82,.4); animation:bk .6s infinite;}
+.sn-name{font-size:10px;color:var(--t2);}
+.sn-tag {margin-left:auto;font-size:9px;color:var(--t4);font-family:var(--mono);}
+
+.side-foot{
+  margin-top:auto;padding:12px 14px;
+  border-top:1px solid var(--b1);
+}
+.sf-label{font-size:8px;color:var(--t4);letter-spacing:.8px;text-transform:uppercase;font-family:var(--mono);}
+.sf-val  {font-size:9px;color:var(--t3);font-family:var(--mono);margin-top:3px;}
+
+/* ── MAIN ────────────────────────────────────────────── */
+.main{flex:1;overflow-y:auto;padding:20px 24px;}
+.pg{display:none;}
+.pg.on{display:block;}
+
+/* ── PAGE HEADER ─────────────────────────────────────── */
+.ph{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b1);}
+.ph-title{font-size:16px;font-weight:600;color:var(--t1);letter-spacing:-.4px;}
+.ph-sub  {font-size:11px;color:var(--t3);margin-top:3px;letter-spacing:.1px;}
+.ph-meta {text-align:right;}
+.ph-meta-l{font-size:8px;color:var(--t4);text-transform:uppercase;letter-spacing:.8px;font-family:var(--mono);}
+.ph-meta-v{font-size:11px;color:var(--cyan);font-family:var(--mono);margin-top:2px;}
+
+/* ── SECTION HEADERS ─────────────────────────────────── */
+.sh{display:flex;align-items:center;gap:8px;margin:16px 0 10px;}
+.sh:first-of-type{margin-top:0;}
+.sh-line{flex:1;height:1px;background:var(--b1);}
+.sh-label{font-size:8px;color:var(--t4);letter-spacing:1.4px;text-transform:uppercase;font-weight:500;white-space:nowrap;}
+.node-tag{
+  font-size:8px;font-family:var(--mono);font-weight:600;letter-spacing:.8px;
+  padding:2px 7px;border-radius:4px;text-transform:uppercase;
+}
+.nt-1{background:rgba(41,169,224,.1); color:var(--cyan);  border:1px solid rgba(41,169,224,.2);}
+.nt-2{background:rgba(224,160,32,.1); color:var(--amber); border:1px solid rgba(224,160,32,.2);}
+
+/* ── BANNER ──────────────────────────────────────────── */
+.banner{
+  display:none;align-items:center;gap:10px;
+  padding:9px 14px;border-radius:var(--r);margin-bottom:14px;
+  font-size:11px;border:1px solid;
+}
+.bn-warn{background:var(--warn-bg);border-color:var(--warn-br);color:var(--warn-tx);}
+.bn-crit{background:var(--crit-bg);border-color:var(--crit-br);color:var(--crit-tx);}
+.banner-ico{flex-shrink:0;opacity:.8;}
+
+/* ── KPI CARDS ───────────────────────────────────────── */
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-bottom:6px;}
+
+.kpi-card{
+  background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);
+  padding:13px 14px;transition:border-color .2s;
+  position:relative;
+}
+.kpi-card:hover{border-color:var(--b2);}
+.kc-warn{background:var(--warn-bg);border-color:var(--warn-br);}
+.kc-crit{background:var(--crit-bg);border-color:var(--crit-br);}
+
+.kpi-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;}
+.kpi-label{font-size:10px;color:var(--t3);letter-spacing:.2px;display:flex;align-items:center;gap:5px;}
+.kpi-label svg{opacity:.6;}
+
+.cb{font-size:8px;padding:2px 5px;border-radius:3px;font-weight:600;letter-spacing:.5px;font-family:var(--mono);}
+.st-badge-ok  {background:rgba(39,179,122,.1); color:var(--green);}
+.st-badge-warn{background:rgba(224,160,32,.1); color:var(--amber);}
+.st-badge-crit{background:rgba(217,58,82,.1);  color:var(--rose);}
+
+.cv{font-size:26px;font-weight:600;line-height:1;letter-spacing:-1.5px;color:var(--t1);}
+.kc-warn .cv{color:var(--amber);}
+.kc-crit .cv{color:var(--rose);}
+.cu{font-size:10px;color:var(--t3);margin-left:2px;font-weight:400;letter-spacing:.2px;}
+
+/* ── CHARTS ──────────────────────────────────────────── */
+.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:6px;}
+@media(max-width:860px){.chart-grid{grid-template-columns:1fr;}}
+
+.chart-box{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:14px;}
+.chart-box:hover{border-color:var(--b2);}
+.cb-head{display:flex;align-items:center;gap:7px;margin-bottom:12px;}
+.cb-title{font-size:10px;font-weight:500;color:var(--t2);}
+.cb-note{font-size:8px;color:var(--t4);margin-left:auto;font-family:var(--mono);}
+.cw{position:relative;height:175px;}
+.cf{font-size:8px;color:var(--t4);margin-top:7px;font-family:var(--mono);letter-spacing:.3px;}
+
+/* ── NODE CARDS ──────────────────────────────────────── */
+.node-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+@media(max-width:700px){.node-row{grid-template-columns:1fr;}}
+
+.node-c{
+  background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);
+  padding:12px 14px;display:flex;align-items:center;gap:10px;
+}
+.nc-ico{width:32px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.ni-1{background:rgba(41,169,224,.07); border:1px solid rgba(41,169,224,.15);}
+.ni-2{background:rgba(224,160,32,.07); border:1px solid rgba(224,160,32,.15);}
+.ni-3{background:rgba(139,92,246,.07); border:1px solid rgba(139,92,246,.15);}
+.nc-body{flex:1;min-width:0;}
+.nc-name{font-size:11px;font-weight:500;color:var(--t1);}
+.nc-desc{font-size:9px;color:var(--t3);margin-top:2px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.nc-st{display:flex;align-items:center;gap:5px;font-size:9px;color:var(--t2);}
+
+/* ── DB FOOTER ROW ───────────────────────────────────── */
+.db-strip{
+  display:flex;flex-wrap:wrap;
+  background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);
+  padding:10px 14px;margin-top:10px;gap:0;
+}
+.db-field{padding:4px 18px 4px 0;border-right:1px solid var(--b1);margin-right:18px;}
+.db-field:last-child{border-right:none;margin-right:0;}
+.db-lbl{font-size:8px;color:var(--t4);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono);}
+.db-val{font-size:10px;color:var(--t2);font-family:var(--mono);margin-top:2px;}
+.st-ok  {color:var(--green)!important;}
+.st-warn{color:var(--amber)!important;}
+.st-crit{color:var(--rose)!important;}
+
+/* ── LOG TABLE ───────────────────────────────────────── */
+.table-wrap{overflow-x:auto;border-radius:var(--r);border:1px solid var(--b1);}
+table{width:100%;border-collapse:collapse;font-size:11px;}
+thead{position:sticky;top:0;z-index:1;}
+th{background:#080c11;color:var(--t4);font-weight:500;font-size:8px;letter-spacing:1px;text-transform:uppercase;padding:9px 12px;text-align:left;border-bottom:1px solid var(--b1);white-space:nowrap;}
+td{padding:8px 12px;border-bottom:1px solid var(--b1);color:var(--t2);vertical-align:middle;}
+tr:last-child td{border-bottom:none;}
+tr:hover td{background:var(--bg-h);}
+.mc{font-family:var(--mono);font-size:9px;color:var(--t3);white-space:nowrap;}
+.dn{color:var(--t1);}
+.du{font-size:9px;color:var(--t4);}
+.dim{color:var(--t4);}
+
+.lpill{font-size:8px;padding:2px 7px;border-radius:3px;font-weight:600;letter-spacing:.5px;font-family:var(--mono);}
+.lp-ok  {background:rgba(39,179,122,.1); color:var(--green);}
+.lp-warn{background:rgba(224,160,32,.1); color:var(--amber);}
+.lp-crit{background:rgba(217,58,82,.1);  color:var(--rose);}
+
+/* ── ALARM PAGE ──────────────────────────────────────── */
+.alarm-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:18px;}
+.ak-card{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:14px;text-align:center;}
+.ak-n{font-size:28px;font-weight:600;line-height:1;font-family:var(--mono);}
+.ak-l{font-size:9px;color:var(--t3);margin-top:5px;text-transform:uppercase;letter-spacing:.8px;}
+.ak-crit{border-color:var(--crit-br);} .ak-crit .ak-n{color:var(--rose);}
+.ak-warn{border-color:var(--warn-br);} .ak-warn .ak-n{color:var(--amber);}
+
+.alarm-row{border-radius:var(--r);border:1px solid;padding:10px 12px;margin-bottom:7px;display:flex;justify-content:space-between;align-items:center;gap:12px;}
+.ar-crit{background:var(--crit-bg);border-color:var(--crit-br);}
+.ar-warn{background:var(--warn-bg);border-color:var(--warn-br);}
+.ar-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.ar-badge{font-size:8px;font-weight:700;letter-spacing:.5px;padding:2px 7px;border-radius:3px;font-family:var(--mono);}
+.arb-crit{background:rgba(217,58,82,.15);color:var(--rose);}
+.arb-warn{background:rgba(224,160,32,.15);color:var(--amber);}
+.ar-tags{display:flex;flex-wrap:wrap;gap:6px;}
+.ar-tags span{font-size:10px;color:var(--t2);}
+.ar-ts{font-size:9px;color:var(--t4);font-family:var(--mono);white-space:nowrap;flex-shrink:0;}
+.empty-st{text-align:center;padding:50px 0;color:var(--t3);}
+.empty-st svg{display:block;margin:0 auto 10px;color:var(--green);}
+.empty-st p{font-size:12px;}
+
+/* ── TEST PAGE ───────────────────────────────────────── */
+.test-info{
+  background:var(--bg-c);border:1px solid var(--b1);border-left:2px solid var(--cyan);
+  border-radius:var(--r);padding:11px 14px;font-size:11px;color:var(--t3);line-height:1.7;margin-bottom:16px;
+}
+.test-info code{font-family:var(--mono);color:var(--cyan);font-size:10px;}
+
+.preset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:8px;margin-bottom:16px;}
+.preset-btn{
+  background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);
+  padding:12px 14px;cursor:pointer;text-align:left;font-family:var(--font);
+  transition:border-color .12s,transform .12s;
+}
+.preset-btn:hover{border-color:var(--b3);transform:translateY(-1px);}
+.pb-l{font-size:12px;font-weight:500;margin-bottom:3px;}
+.pb-d{font-size:9px;color:var(--t3);font-family:var(--mono);}
+.pb-0 .pb-l{color:var(--green);} 
+.pb-1 .pb-l{color:var(--amber);}
+.pb-2 .pb-l,.pb-3 .pb-l{color:var(--rose);}
+.pb-2,.pb-3{border-color:rgba(217,58,82,.15);}
+
+.input-block{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:16px;}
+.ir{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;}
+.ir-l{font-size:11px;color:var(--t2);}
+.ir-u{font-size:9px;color:var(--t4);}
+.inp{
+  width:110px;background:var(--bg);border:1px solid var(--b2);
+  border-radius:6px;color:var(--t1);font-size:12px;padding:6px 10px;
+  text-align:right;font-family:var(--mono);outline:none;transition:border-color .12s;
+}
+.inp:focus{border-color:var(--cyan);}
+.send-btn{
+  width:100%;margin-top:10px;
+  background:rgba(41,169,224,.07);border:1px solid rgba(41,169,224,.2);
+  border-radius:7px;color:var(--cyan);font-size:12px;font-weight:500;
+  padding:10px;cursor:pointer;font-family:var(--font);transition:background .12s;
+}
+.send-btn:hover{background:rgba(41,169,224,.14);}
+
+/* ── TOAST ───────────────────────────────────────────── */
+.toast{
+  position:fixed;bottom:18px;right:18px;z-index:9999;
+  padding:8px 14px;border-radius:6px;border:1px solid;
+  font-size:10px;font-family:var(--mono);letter-spacing:.3px;
+  opacity:0;transform:translateY(10px);transition:opacity .2s,transform .2s;pointer-events:none;
+}
+.t-ok {background:var(--ok-bg); border-color:var(--ok-br); color:var(--green);}
+.t-err{background:var(--crit-bg);border-color:var(--crit-br);color:var(--rose);}
+
+@media(max-width:640px){
+  .side{display:none;}
+  .main{padding:12px 14px;}
+  .kpi-row{grid-template-columns:repeat(2,1fr);}
+  .alarm-kpi{grid-template-columns:repeat(3,1fr);}
+  .node-row{grid-template-columns:1fr;}
+}
+</style>
+</head>
+<body>
+
+<!-- STATUS BAR -->
+<div class="sb sb-ok" id="sb">
+  <span class="sb-dot"></span>
+  <span id="sb-txt">MENGHUBUNGKAN KE REALTIME DATABASE...</span>
+</div>
+
+<div class="shell">
+
+<!-- ── SIDEBAR ──────────────────────────────────────── -->
+<nav class="side">
+  <div class="side-brand">
+    <div class="brand-row">
+      <div class="brand-sq">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#29a9e0" stroke-width="2" stroke-linecap="round">
+          <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+        </svg>
+      </div>
+      <div class="brand-name">SmartFactory</div>
+    </div>
+    <div class="brand-id">Industrial Telemetry Platform</div>
+  </div>
+
+  <div class="nav-grp">
+    <div class="nav-grp-label">Monitor</div>
+    <button class="nb on" onclick="nav('dashboard')">
+      <svg class="nb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+      Dashboard
+    </button>
+    <button class="nb" onclick="nav('log')">
+      <svg class="nb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
+      Log Data
+    </button>
+  </div>
+
+  <div class="nav-grp">
+    <div class="nav-grp-label">Alert</div>
+    <button class="nb" onclick="nav('alarm')">
+      <svg class="nb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1a5 5 0 0 1 5 5v3l1 2H2l1-2V6a5 5 0 0 1 5-5zM6.5 13a1.5 1.5 0 0 0 3 0"/></svg>
+      Alarm Center
+      <span class="n-badge" id="alarm-badge">0</span>
+    </button>
+  </div>
+
+  <div class="nav-grp">
+    <div class="nav-grp-label">Node Status</div>
+    <div class="side-nodes">
+      <div class="sn-row"><span class="sdot sd-ok" id="dot-n1"></span><span class="sn-name">ESP32 Node 1</span><span class="sn-tag">Machine</span></div>
+      <div class="sn-row"><span class="sdot sd-ok" id="dot-n2"></span><span class="sn-name">ESP32 Node 2</span><span class="sn-tag">Environ</span></div>
+      <div class="sn-row"><span class="sdot sd-ok" id="dot-n3"></span><span class="sn-name">ESP32 Node 3</span><span class="sn-tag">Gateway</span></div>
+    </div>
+  </div>
+
+  <div class="nav-grp">
+    <div class="nav-grp-label">Dev Tools</div>
+    <button class="nb" onclick="nav('test')">
+      <svg class="nb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3M8 11v.5"/></svg>
+      Test Insert
+    </button>
+  </div>
+
+  <div class="side-foot">
+    <div class="sf-label">RTDB Node</div>
+    <div class="sf-val">factory_data</div>
+    <div class="sf-val" style="color:var(--t4);margin-top:3px">asia-southeast1</div>
+  </div>
+</nav>
+
+<!-- ── MAIN ─────────────────────────────────────────── -->
+<main class="main">
+
+  <!-- ═══ DASHBOARD ════════════════════════════════ -->
+  <div class="pg on" id="pg-dashboard">
+
+    <div class="ph">
+      <div>
+        <div class="ph-title">Dashboard</div>
+        <div class="ph-sub">Machine &amp; Environment — Real-time</div>
+      </div>
+      <div class="ph-meta">
+        <div class="ph-meta-l">Last update</div>
+        <div class="ph-meta-v" id="hdr-ts">--:--:--</div>
+      </div>
+    </div>
+
+    <!-- Banner -->
+    <div class="banner" id="banner">
+      <svg class="banner-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span id="banner-text"></span>
+    </div>
+
+    <!-- NODE 1 -->
+    <div class="sh">
+      <span class="node-tag nt-1">Node 1</span>
+      <span class="sh-label">Machine Monitoring · ESP32 #1</span>
+      <div class="sh-line"></div>
+    </div>
+    <div class="kpi-row">
+      <!-- Getaran -->
+      <div class="kpi-card kc-ok" id="c-getaran">
+        <div class="kpi-top">
+          <span class="kpi-label">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h2M5 6l1.5 2M5 18l1.5-2M12 2v2M12 20v2M19 6l-1.5 2M19 18l-1.5-2M22 12h-2"/><circle cx="12" cy="12" r="4"/></svg>
+            Getaran
+          </span>
+          <span class="cb st-badge-ok">NORMAL</span>
+        </div>
+        <div><span class="cv">—</span><span class="cu">mm/s</span></div>
+      </div>
+      <!-- Arus -->
+      <div class="kpi-card kc-ok" id="c-arus">
+        <div class="kpi-top">
+          <span class="kpi-label">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+            Arus Listrik
+          </span>
+          <span class="cb st-badge-ok">NORMAL</span>
+        </div>
+        <div><span class="cv">—</span><span class="cu">A</span></div>
+      </div>
+      <!-- Suhu Node 1 -->
+      <div class="kpi-card kc-ok" id="c-suhu-n1">
+        <div class="kpi-top">
+          <span class="kpi-label">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
+            Suhu Mesin
+          </span>
+          <span class="cb st-badge-ok">NORMAL</span>
+        </div>
+        <div><span class="cv">—</span><span class="cu">°C</span></div>
+      </div>
+    </div>
+
+    <!-- NODE 2 -->
+    <div class="sh">
+      <span class="node-tag nt-2">Node 2</span>
+      <span class="sh-label">Environment Monitoring · ESP32 #2</span>
+      <div class="sh-line"></div>
+    </div>
+    <div class="kpi-row">
+      <!-- Suhu -->
+      <div class="kpi-card kc-ok" id="c-suhu">
+        <div class="kpi-top">
+          <span class="kpi-label">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
+            Suhu Ruang
+          </span>
+          <span class="cb st-badge-ok">NORMAL</span>
+        </div>
+        <div><span class="cv">—</span><span class="cu">°C</span></div>
+      </div>
+      <!-- Gas -->
+      <div class="kpi-card kc-ok" id="c-gas">
+        <div class="kpi-top">
+          <span class="kpi-label">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2c0 4-4 5-4 10a8 8 0 0 0 16 0c0-5-4-6-4-10"/><path d="M12 22v-4"/></svg>
+            Gas / Asap
+          </span>
+          <span class="cb st-badge-ok">NORMAL</span>
+        </div>
+        <div><span class="cv">—</span><span class="cu">ppm</span></div>
+      </div>
+      <!-- Kelembaban -->
+      <div class="kpi-card kc-ok" id="c-hum">
+        <div class="kpi-top">
+          <span class="kpi-label">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
+            Kelembaban
+          </span>
+          <span class="cb st-badge-ok">NORMAL</span>
+        </div>
+        <div><span class="cv">—</span><span class="cu">%</span></div>
+      </div>
+    </div>
+
+    <!-- CHARTS -->
+    <div class="sh">
+      <span class="sh-label">Trend Charts</span>
+      <div class="sh-line"></div>
+    </div>
+    <div class="chart-grid">
+      <div class="chart-box">
+        <div class="cb-head">
+          <span class="node-tag nt-1" style="margin:0">Node 1</span>
+          <span class="cb-title">Getaran · Arus · Suhu Mesin</span>
+          <span class="cb-note">30 data</span>
+        </div>
+        <div class="cw"><canvas id="chart-n1"></canvas></div>
+        <div class="cf">Getaran (mm/s) · Arus (A) · Suhu N1 (°C)</div>
+      </div>
+      <div class="chart-box">
+        <div class="cb-head">
+          <span class="node-tag nt-2" style="margin:0">Node 2</span>
+          <span class="cb-title">Suhu Ruang · Gas · Kelembaban</span>
+          <span class="cb-note">30 data</span>
+        </div>
+        <div class="cw"><canvas id="chart-n2"></canvas></div>
+        <div class="cf">Gas dibagi 10 untuk keseragaman skala</div>
+      </div>
+    </div>
+
+    <!-- NODE OVERVIEW -->
+    <div class="sh">
+      <span class="sh-label">Node Overview</span>
+      <div class="sh-line"></div>
+    </div>
+    <div class="node-row">
+      <div class="node-c">
+        <div class="nc-ico ni-1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#29a9e0" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#29a9e0" stroke="none"/></svg>
+        </div>
+        <div class="nc-body">
+          <div class="nc-name">ESP32 Node 1</div>
+          <div class="nc-desc">Machine · MQTT → factoryesp1in</div>
+        </div>
+        <div class="nc-st"><span class="sdot sd-ok" style="width:5px;height:5px"></span>Online</div>
+      </div>
+      <div class="node-c">
+        <div class="nc-ico ni-2">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#e0a020" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#e0a020" stroke="none"/></svg>
+        </div>
+        <div class="nc-body">
+          <div class="nc-name">ESP32 Node 2</div>
+          <div class="nc-desc">Environment · MQTT → factoryesp2in</div>
+        </div>
+        <div class="nc-st"><span class="sdot sd-ok" style="width:5px;height:5px"></span>Online</div>
+      </div>
+      <div class="node-c">
+        <div class="nc-ico ni-3">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+        </div>
+        <div class="nc-body">
+          <div class="nc-name">ESP32 Node 3</div>
+          <div class="nc-desc">Gateway → Realtime Database</div>
+        </div>
+        <div class="nc-st"><span class="sdot sd-ok" style="width:5px;height:5px"></span>Online</div>
+      </div>
+    </div>
+
+    <!-- DB STRIP -->
+    <div class="db-strip">
+      <div class="db-field"><div class="db-lbl">Node Path</div><div class="db-val">factory_data</div></div>
+      <div class="db-field"><div class="db-lbl">Record ID</div><div class="db-val" id="db-id">—</div></div>
+      <div class="db-field"><div class="db-lbl">Status</div><div class="db-val st-ok" id="db-status">—</div></div>
+      <div class="db-field"><div class="db-lbl">Waktu Tercatat</div><div class="db-val" id="db-ts">—</div></div>
+    </div>
+
+  </div><!-- end dashboard -->
+
+  <!-- ═══ LOG ══════════════════════════════════════ -->
+  <div class="pg" id="pg-log">
+    <div class="ph">
+      <div><div class="ph-title">Log Data</div><div class="ph-sub">Riwayat 30 data terbaru</div></div>
+      <div class="ph-meta"><div class="ph-meta-v" id="log-count" style="color:var(--t3)">0 entri</div></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Waktu</th><th>Getaran</th><th>Arus</th>
+          <th>Suhu N1</th><th>Suhu N2</th><th>Gas/Asap</th>
+          <th>Kelembaban</th><th>Status</th>
+        </tr></thead>
+        <tbody id="log-tbody"><tr><td colspan="8" style="text-align:center;color:var(--t4);padding:40px">Memuat data...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══ ALARM ═════════════════════════════════════ -->
+  <div class="pg" id="pg-alarm">
+    <div class="ph"><div><div class="ph-title">Alarm Center</div><div class="ph-sub">Riwayat kejadian warning &amp; anomali</div></div></div>
+    <div class="alarm-kpi">
+      <div class="ak-card ak-crit"><div class="ak-n" id="s-crit">0</div><div class="ak-l">Anomali</div></div>
+      <div class="ak-card ak-warn"><div class="ak-n" id="s-warn">0</div><div class="ak-l">Warning</div></div>
+      <div class="ak-card"><div class="ak-n" style="color:var(--t2)" id="s-total">0</div><div class="ak-l">Total</div></div>
+    </div>
+    <div class="sh"><span class="sh-label">Riwayat Event</span><div class="sh-line"></div></div>
+    <div id="alarm-list"><div style="text-align:center;color:var(--t4);padding:40px">Memuat...</div></div>
+  </div>
+
+  <!-- ═══ TEST ══════════════════════════════════════ -->
+  <div class="pg" id="pg-test">
+    <div class="ph"><div><div class="ph-title">Test Insert</div><div class="ph-sub">Simulasi injeksi data ke Realtime Database</div></div></div>
+    <div class="test-info">Tombol ini menulis data dummy ke path <code>factory_data/{tanggal}/{jam}</code> untuk memverifikasi reaksi realtime dashboard.</div>
+    <div class="sh"><span class="sh-label">Preset Cepat</span><div class="sh-line"></div></div>
+    <div class="preset-grid">
+      <button class="preset-btn pb-0" onclick="sendPreset(0)"><div class="pb-l">Normal</div><div class="pb-d">Gas 180ppm · Suhu 35°C</div></button>
+      <button class="preset-btn pb-1" onclick="sendPreset(1)"><div class="pb-l">Warning Suhu</div><div class="pb-d">Gas 260ppm · Suhu 40°C</div></button>
+      <button class="preset-btn pb-2" onclick="sendPreset(2)"><div class="pb-l">Anomali Gas</div><div class="pb-d">Gas 318ppm · Kebocoran</div></button>
+      <button class="preset-btn pb-3" onclick="sendPreset(3)"><div class="pb-l">Full Anomali</div><div class="pb-d">Gas 420ppm · Suhu 50°C</div></button>
+    </div>
+    <div class="sh"><span class="sh-label">Input Manual</span><div class="sh-line"></div></div>
+    <div class="input-block">
+      <div class="ir"><span class="ir-l">Getaran <span class="ir-u">(mm/s)</span></span><input class="inp" id="i-getaran" type="number" value="2.0" step="0.1"/></div>
+      <div class="ir"><span class="ir-l">Arus <span class="ir-u">(A)</span></span><input class="inp" id="i-arus" type="number" value="3.5" step="0.1"/></div>
+      <div class="ir"><span class="ir-l">Suhu <span class="ir-u">(°C)</span></span><input class="inp" id="i-suhu" type="number" value="37"/></div>
+      <div class="ir"><span class="ir-l">Kelembaban <span class="ir-u">(%)</span></span><input class="inp" id="i-hum" type="number" value="70"/></div>
+      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(ppm)</span></span><input class="inp" id="i-gas" type="number" value="200"/></div>
+      <button class="send-btn" onclick="sendCustom()">Kirim ke Database</button>
+    </div>
+  </div>
+
+</main>
+</div><!-- shell -->
+
+<div id="toast" class="toast t-ok"></div>
+
+<script>
+function nav(p) {
+  document.querySelectorAll('.pg').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.nb').forEach(x=>x.classList.remove('on'));
+  document.getElementById('pg-'+p).classList.add('on');
+  document.querySelector(`[onclick="nav('${p}')"]`).classList.add('on');
+}
+</script>
+</body>
+</html>

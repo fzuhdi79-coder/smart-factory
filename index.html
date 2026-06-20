@@ -54,7 +54,7 @@ onValue(ref(db,'factory_data'), snap => {
         getaran:  e.node_machine?.getaran  || 0,
         arus:     e.node_machine?.arus      || 0,
         suhu_n1:  e.node_machine?.suhu      || 0,
-        suhu_n2:  e.node_environment?.suhu  || e.node_machine?.suhu || 0,
+        suhu_n2:  e.node_environment?.suhu  || 0,
         hum:      e.node_environment?.humidity || 0,
         gas:      e.node_environment?.gas   || 0,
         anom_mach:  e.node_machine?.anomali       || false,
@@ -238,6 +238,8 @@ function mkSuhuN2(id) {
 }
 
 // Chart 5 — Gas: bar chart, rose/red, danger feel
+// NB: warna per-bar di-generate saat updateCharts (bukan scriptable callback)
+//     karena ctx2.parsed belum tersedia saat chart kosong di init
 function mkGas(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#dc2626';
@@ -245,21 +247,12 @@ function mkGas(id) {
     type: 'bar',
     data: { labels:[], datasets:[{
       label:'Gas/Asap', data:[],
-      backgroundColor: (ctx2) => {
-        const v = ctx2.parsed?.y ?? 0;
-        if (v >= 300) return '#dc262666';
-        if (v >= 250) return '#f59e0b55';
-        return '#dc262622';
-      },
-      borderColor: (ctx2) => {
-        const v = ctx2.parsed?.y ?? 0;
-        if (v >= 300) return '#dc2626';
-        if (v >= 250) return '#f59e0b';
-        return '#dc2626aa';
-      },
+      backgroundColor: [],   // diisi array per update
+      borderColor:     [],   // diisi array per update
       borderWidth: 1.5,
       borderRadius: 3,
-      hoverBackgroundColor: color+'55'
+      borderSkipped: false,
+      hoverBackgroundColor: color+'66'
     }]},
     options: baseOpts('ppm', color)
   });
@@ -315,8 +308,28 @@ function updateCharts(docs) {
   upd('arus',    d => d.arus    ?? 0);
   upd('suhuN1',  d => d.suhu_n1 ?? 0);
   upd('suhuN2',  d => d.suhu_n2 ?? 0);
-  upd('gas',     d => d.gas     ?? 0);
   upd('hum',     d => d.hum     ?? 0);
+
+  // Gas — update dengan array warna per-bar berdasarkan threshold
+  const cGas = charts.gas;
+  if (cGas) {
+    const gasVals = docs.map(d => d.gas ?? 0);
+    const bgColors = gasVals.map(v => {
+      if (v >= 300) return '#dc262655';
+      if (v >= 250) return '#f59e0b44';
+      return '#dc262620';
+    });
+    const bdColors = gasVals.map(v => {
+      if (v >= 300) return '#dc2626';
+      if (v >= 250) return '#f59e0b';
+      return '#dc2626aa';
+    });
+    cGas.data.labels = labels;
+    cGas.data.datasets[0].data            = gasVals;
+    cGas.data.datasets[0].backgroundColor = bgColors;
+    cGas.data.datasets[0].borderColor     = bdColors;
+    cGas.update('none');
+  }
 }
 
 function renderLog(docs) {

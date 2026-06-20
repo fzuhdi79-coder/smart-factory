@@ -125,11 +125,43 @@ function updateNodeLastSeen(d) {
   refreshNodeDots();
 }
 
+// ── Fitur Auto-Toggle Status Online/Offline ───────────────────────────
 function refreshNodeDots() {
+  const latest = window.__sf?.latest;
+  
+  // Jika belum ada data sama sekali di database
+  if (!latest) {
+    dot('dot-n1', 'crit');
+    dot('dot-n2', 'crit');
+    dot('dot-n3', 'crit');
+    return;
+  }
+
   const now = Date.now();
-  dot('dot-n1', now - nodeLastSeen.n1 < NODE_STALE_MS ? 'ok' : 'crit');
-  dot('dot-n2', now - nodeLastSeen.n2 < NODE_STALE_MS ? 'ok' : 'crit');
-  dot('dot-n3', 'ok'); // Node 3 selalu OK jika data masuk Firebase
+  // Membandingkan waktu saat ini dengan timestamp data terakhir yang masuk
+  const isStale = (now - latest.time) > NODE_STALE_MS;
+
+  // Set status lingkaran & teks secara dinamis
+  dot('dot-n1', (!isStale && latest.hasN1) ? 'ok' : 'crit');
+  dot('dot-n2', (!isStale && latest.hasN2) ? 'ok' : 'crit');
+  dot('dot-n3', !isStale ? 'ok' : 'crit'); // Node 3 otomatis OFFLINE jika data mandek > 20 detik
+}
+
+function dot(id, st) {
+  const el = document.getElementById(id);
+  if (el) el.className = `sdot sd-${st}`;
+  
+  // Update seluruh dot dan teks pendukung di bagian Node Overview
+  const els = document.querySelectorAll(`.sdot-${id}`);
+  els.forEach(e => {
+    e.className = `sdot sd-${st} sdot-${id}`;
+    
+    // PERBAIKAN: Mengubah teks 'Online' / 'Offline' di sebelah lingkaran secara dinamis
+    let nextText = e.nextSibling;
+    if (nextText && nextText.nodeType === Node.TEXT_NODE) {
+      nextText.textContent = st === 'ok' ? 'Online' : 'Offline';
+    }
+  });
 }
 
 // Refresh dot setiap 5 detik agar status offline terdeteksi

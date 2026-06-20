@@ -51,12 +51,12 @@ onValue(ref(db,'factory_data'), snap => {
         id: `${tgl}_${jam}`,
         ts: e.waktu_lengkap || `${tgl} ${jam.replace(/_/g,':')}`,
         time: new Date((e.waktu_lengkap||'').replace(/-/g,'/')||Date.now()),
-        getaran:  e.node_machine?.getaran  || 0,
-        arus:     e.node_machine?.arus      || 0,
-        suhu_n1:  e.node_machine?.suhu      || 0,
-        suhu_n2:  e.node_environment?.suhu  || 0,
-        hum:      e.node_environment?.humidity || 0,
-        gas:      e.node_environment?.gas   || 0,
+        getaran:  parseFloat(e.node_machine?.getaran)  || 0,
+        arus:     parseFloat(e.node_machine?.arus)      || 0,
+        suhu_n1:  parseFloat(e.node_machine?.suhu)      || 0,
+        suhu_n2:  parseFloat(e.node_environment?.suhu)  || 0,
+        hum:      parseFloat(e.node_environment?.humidity) || 0,
+        gas:      parseFloat(e.node_environment?.gas)   || 0,
         anom_mach:  e.node_machine?.anomali       || false,
         leak_env:   e.node_environment?.kebocoran || false,
       };
@@ -388,10 +388,10 @@ function sbState(st, msg) {
 }
 
 const PRESETS = [
-  {label:'Normal',      data:{getaran:1.8,arus:3.2,suhu:35,hum:72,gas:180,am:false,ke:false}},
-  {label:'Warning Suhu',data:{getaran:2.1,arus:3.5,suhu:40,hum:65,gas:260,am:false,ke:false}},
-  {label:'Anomali Gas', data:{getaran:2.4,arus:3.7,suhu:41,hum:68,gas:318,am:false,ke:true }},
-  {label:'Full Anomali',data:{getaran:3.5,arus:5.2,suhu:50,hum:90,gas:420,am:true, ke:true }},
+  {label:'Normal',      data:{getaran:1.8, arus:3.2, suhu_m:35, suhu_e:28, hum:72, gas:180, am:false, ke:false}},
+  {label:'Warning Suhu',data:{getaran:2.1, arus:3.5, suhu_m:40, suhu_e:32, hum:65, gas:260, am:false, ke:false}},
+  {label:'Anomali Gas', data:{getaran:2.4, arus:3.7, suhu_m:41, suhu_e:33, hum:68, gas:318, am:false, ke:true }},
+  {label:'Full Anomali',data:{getaran:3.5, arus:5.2, suhu_m:50, suhu_e:38, hum:90, gas:420, am:true,  ke:true }},
 ];
 function pathNow() {
   const n=new Date(), tgl=n.toISOString().split('T')[0];
@@ -403,20 +403,20 @@ window.sendPreset = async i => {
   try {
     await set(ref(db,`factory_data/${t.tgl}/${t.jam}`),{
       waktu_lengkap:t.full,
-      node_machine:{anomali:p.am,arus:p.arus,getaran:p.getaran,suhu:p.suhu},
-      node_environment:{gas:p.gas,humidity:p.hum,kebocoran:p.ke,suhu:p.suhu}
+      node_machine:     {anomali:p.am, arus:p.arus, getaran:p.getaran, suhu:p.suhu_m},
+      node_environment: {gas:p.gas, humidity:p.hum, kebocoran:p.ke, suhu:p.suhu_e}
     });
     toast(`Preset "${PRESETS[i].label}" dikirim`);
   } catch(e){toast(e.message,true);}
 };
 window.sendCustom = async () => {
   const g=id=>parseFloat(document.getElementById(id)?.value||'0'), t=pathNow();
-  const gas=g('i-gas'), suhu=g('i-suhu');
+  const gas=g('i-gas'), suhu_m=g('i-suhu-m'), suhu_e=g('i-suhu-e');
   try {
     await set(ref(db,`factory_data/${t.tgl}/${t.jam}`),{
       waktu_lengkap:t.full,
-      node_machine:{anomali:false,arus:g('i-arus'),getaran:g('i-getaran'),suhu},
-      node_environment:{gas,humidity:g('i-hum'),kebocoran:(gas>300),suhu}
+      node_machine:     {anomali:false, arus:g('i-arus'), getaran:g('i-getaran'), suhu:suhu_m},
+      node_environment: {gas, humidity:g('i-hum'), kebocoran:(gas>300), suhu:suhu_e}
     });
     toast('Data custom berhasil dikirim');
   } catch(e){toast(e.message,true);}

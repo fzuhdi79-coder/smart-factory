@@ -25,256 +25,260 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getDatabase(app);
 
+// ── Threshold ──────────────────────────────────────────────────
 const THR = {
-  suhu:    {warn:38, danger:42},
-  gas:     {warn:250,danger:300},
-  getaran: {warn:2.0,danger:3.0},
-  arus:    {warn:4.0,danger:5.0},
+  suhu:    { warn: 38,  danger: 42  },
+  gas:     { warn: 250, danger: 300 },
+  getaran: { warn: 2.0, danger: 3.0 },
+  arus:    { warn: 4.0, danger: 5.0 },
 };
 
 function getSt(key, val) {
   const t = THR[key];
-  if (!t || val==null) return 'ok';
+  if (!t || val == null) return 'ok';
   if (val >= t.danger) return 'crit';
   if (val >= t.warn)   return 'warn';
   return 'ok';
 }
 
-window.__sf = { latest:null, hist:[], alarms:[], cN1:null, cN2:null, db };
+// Waktu terakhir ada data dari masing-masing node (untuk status dot)
+const nodeLastSeen = { n1: 0, n2: 0 };
+const NODE_STALE_MS = 20000; // Anggap offline jika tidak ada data >20 detik
 
-onValue(ref(db,'factory_data'), snap => {
-  const raw = snap.val(); let flat = [];
+window.__sf = { latest: null, hist: [], alarms: [], cN1: null, cN2: null, db };
+
+// ── Firebase Listener ─────────────────────────────────────────
+onValue(ref(db, 'factory_data'), snap => {
+  const raw = snap.val();
+  let flat = [];
+
   if (raw) {
-    for (const tgl in raw) for (const jam in raw[tgl]) {
-      const e = raw[tgl][jam];
-      const d = {
-        id: `${tgl}_${jam}`,
-        ts: e.waktu_lengkap || `${tgl} ${jam.replace(/_/g,':')}`,
-        time: new Date((e.waktu_lengkap||'').replace(/-/g,'/')||Date.now()),
-        getaran:  parseFloat(e.node_machine?.getaran)  || 0,
-        arus:     parseFloat(e.node_machine?.arus)      || 0,
-        suhu_n1:  parseFloat(e.node_machine?.suhu)      || 0,
-        suhu_n2:  parseFloat(e.node_environment?.suhu)  || 0,
-        hum:      parseFloat(e.node_environment?.humidity) || 0,
-        gas:      parseFloat(e.node_environment?.gas)   || 0,
-        anom_mach:  e.node_machine?.anomali       || false,
-        leak_env:   e.node_environment?.kebocoran || false,
-      };
-      let st = 'ok';
-      if (d.anom_mach || d.leak_env) st = 'crit';
-      else if (getSt('suhu',d.suhu_n2)==='warn' || getSt('gas',d.gas)==='warn') st='warn';
-      d.status = st;
-      flat.push(d);
+    for (const tgl in raw) {
+      for (const jam in raw[tgl]) {
+        const e = raw[tgl][jam];
+
+        // Normalisasi timestamp: ganti underscore jam menjadi titik dua
+        // Path key baru: "14_30_05_3872" → tampil sebagai "14:30:05"
+        const jamClean = jam.replace(/_(\d{4})$/, '').replace(/_/g, ':');
+        const tsStr = e.waktu_lengkap || `${tgl} ${jamClean}`;
+
+        const d = {
+          id:       `${tgl}_${jam}`,
+          ts:       tsStr,
+          time:     new Date((tsStr || '').replace(/-/g, '/') || Date.now()),
+          getaran:  parseFloat(e.node_machine?.getaran)      || 0,
+          arus:     parseFloat(e.node_machine?.arus)         || 0,
+          suhu_n1:  parseFloat(e.node_machine?.suhu)         || 0,
+          suhu_n2:  parseFloat(e.node_environment?.suhu)     || 0,
+          hum:      parseFloat(e.node_environment?.humidity) || 0,
+          gas:      parseFloat(e.node_environment?.gas)      || 0,
+          anom_mach:  e.node_machine?.anomali      || false,
+          leak_env:   e.node_environment?.kebocoran || false,
+          // Flag ketersediaan data per node
+          hasN1: !!e.node_machine,
+          hasN2: !!e.node_environment,
+        };
+
+        // Tentukan status keseluruhan
+        let st = 'ok';
+        if (d.anom_mach || d.leak_env) st = 'crit';
+        else if (
+          getSt('suhu', d.suhu_n2) === 'warn' ||
+          getSt('gas',  d.gas)     === 'warn' ||
+          getSt('suhu', d.suhu_n1) === 'warn' ||
+          getSt('getaran', d.getaran) === 'warn' ||
+          getSt('arus', d.arus) === 'warn'
+        ) st = 'warn';
+        d.status = st;
+
+        flat.push(d);
+      }
     }
   }
-  flat.sort((a,b)=>b.time-a.time);
-  const hist  = flat.slice(0,30);
-  const alarms = flat.filter(d=>d.status!=='ok').slice(0,50);
+
+  flat.sort((a, b) => b.time - a.time);
+
+  const hist   = flat.slice(0, 30);
+  const alarms = flat.filter(d => d.status !== 'ok').slice(0, 50);
+
   window.__sf.hist   = hist;
   window.__sf.alarms = alarms;
-  if (hist.length) { window.__sf.latest=hist[0]; renderDash(hist[0]); updateSB(hist[0]); }
+
+  if (hist.length) {
+    window.__sf.latest = hist[0];
+    renderDash(hist[0]);
+    updateSB(hist[0]);
+    updateNodeLastSeen(hist[0]);
+  }
+
   renderLog(hist);
   renderAlarms(alarms);
   updateCharts(hist.slice().reverse());
-}, err => sbState('conn-err','KONEKSI GAGAL — '+err.message));
 
+}, err => sbState('conn-err', 'KONEKSI GAGAL — ' + err.message));
+
+// Update waktu terakhir node terlihat, lalu refresh dot status
+function updateNodeLastSeen(d) {
+  const now = Date.now();
+  if (d.hasN1) nodeLastSeen.n1 = now;
+  if (d.hasN2) nodeLastSeen.n2 = now;
+  refreshNodeDots();
+}
+
+function refreshNodeDots() {
+  const now = Date.now();
+  dot('dot-n1', now - nodeLastSeen.n1 < NODE_STALE_MS ? 'ok' : 'crit');
+  dot('dot-n2', now - nodeLastSeen.n2 < NODE_STALE_MS ? 'ok' : 'crit');
+  dot('dot-n3', 'ok'); // Node 3 selalu OK jika data masuk Firebase
+}
+
+// Refresh dot setiap 5 detik agar status offline terdeteksi
+setInterval(refreshNodeDots, 5000);
+
+// ── Render Dashboard ───────────────────────────────────────────
 function renderDash(d) {
-  setCard('c-getaran', d.getaran, 'mm/s', getSt('getaran',d.getaran));
-  setCard('c-arus',    d.arus,    'A',    getSt('arus',d.arus));
-  setCard('c-suhu-n1', d.suhu_n1, '°C',  getSt('suhu',d.suhu_n1));
-  setCard('c-suhu',    d.suhu_n2, '°C',  getSt('suhu',d.suhu_n2));
-  setCard('c-gas',     d.gas,     'ppm', getSt('gas',d.gas));
+  setCard('c-getaran', d.getaran, 'mm/s', getSt('getaran', d.getaran));
+  setCard('c-arus',    d.arus,    'A',    getSt('arus',    d.arus));
+  setCard('c-suhu-n1', d.suhu_n1, '°C',  getSt('suhu',    d.suhu_n1));
+  setCard('c-suhu',    d.suhu_n2, '°C',  getSt('suhu',    d.suhu_n2));
+  setCard('c-gas',     d.gas,     'ppm', getSt('gas',     d.gas));
   setCard('c-hum',     d.hum,     '%',   'ok');
 
-  dot('dot-n1', d.anom_mach ? 'crit':'ok');
-  dot('dot-n2', d.leak_env  ? 'crit':'ok');
-  dot('dot-n3', 'ok');
+  // Tanda "N/A" jika node tidak mengirim data di record ini
+  if (!d.hasN1) {
+    ['c-getaran','c-arus','c-suhu-n1'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.querySelector('.cv').textContent = 'N/A';
+    });
+  }
+  if (!d.hasN2) {
+    ['c-suhu','c-gas','c-hum'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.querySelector('.cv').textContent = 'N/A';
+    });
+  }
 
+  // Banner alert
   const banner = document.getElementById('banner');
   if (d.status !== 'ok') {
     const msgs = [];
-    if (d.leak_env)   msgs.push('Kebocoran gas terdeteksi — Node 2');
-    if (d.anom_mach)  msgs.push('Anomali mesin terdeteksi — Node 1');
+    if (d.leak_env)  msgs.push('Kebocoran gas terdeteksi — Node 2');
+    if (d.anom_mach) msgs.push('Anomali mesin terdeteksi — Node 1');
     if (!msgs.length) msgs.push('Parameter sensor mendekati batas bahaya');
     document.getElementById('banner-text').textContent = msgs.join('  ·  ');
     banner.className = `banner bn-${d.status}`;
     banner.style.display = 'flex';
-  } else { banner.style.display = 'none'; }
+  } else {
+    banner.style.display = 'none';
+  }
 
   document.getElementById('db-id').textContent     = d.id;
-  document.getElementById('db-status').textContent = d.status === 'ok' ? 'NORMAL' : d.status === 'warn' ? 'WARNING' : 'ANOMALI';
-  document.getElementById('db-status').className   = `db-val st-${d.status}`;
-  document.getElementById('db-ts').textContent     = d.ts;
-  document.getElementById('hdr-ts').textContent    = new Date().toLocaleTimeString('id-ID');
+  document.getElementById('db-n1').textContent     = d.hasN1 ? 'Ada' : 'Tidak ada';
+  document.getElementById('db-n2').textContent     = d.hasN2 ? 'Ada' : 'Tidak ada';
+  document.getElementById('db-status').textContent =
+    d.status === 'ok' ? 'NORMAL' : d.status === 'warn' ? 'WARNING' : 'ANOMALI';
+  document.getElementById('db-status').className = `db-val st-${d.status}`;
+  document.getElementById('db-ts').textContent = d.ts;
+  document.getElementById('hdr-ts').textContent = new Date().toLocaleTimeString('id-ID');
 }
 
 function setCard(id, val, unit, st) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.querySelector('.cv').textContent = val!=null ? parseFloat(val).toFixed(2) : '—';
+  el.querySelector('.cv').textContent = val != null ? parseFloat(val).toFixed(2) : '—';
   el.querySelector('.cu').textContent = unit;
-  const stLabels = {ok:'NORMAL',warn:'WARNING',crit:'ANOMALI'};
+  const stLabels = { ok: 'NORMAL', warn: 'WARNING', crit: 'ANOMALI' };
   const badge = el.querySelector('.cb');
-  if (badge) { badge.textContent=stLabels[st]||'NORMAL'; badge.className=`cb st-badge-${st}`; }
+  if (badge) { badge.textContent = stLabels[st] || 'NORMAL'; badge.className = `cb st-badge-${st}`; }
   el.className = `kpi-card kc-${st}`;
 }
 
 function dot(id, st) {
   const el = document.getElementById(id);
   if (el) el.className = `sdot sd-${st}`;
+  // Update node-overview dot juga
+  const els = document.querySelectorAll(`.sdot-${id}`);
+  els.forEach(e => e.className = `sdot sd-${st} sdot-${id}`);
 }
 
-/* ── INDIVIDUAL CHART FACTORIES ──────────────────── */
-
-// Base tooltip & axis shared config
-function baseOpts(yLabel, color, extra={}) {
+// ── Chart Factories ────────────────────────────────────────────
+function baseOpts(yLabel, color, extra = {}) {
   return {
     responsive: true, maintainAspectRatio: false,
     animation: { duration: 350 },
-    interaction: { mode:'index', intersect:false },
+    interaction: { mode: 'index', intersect: false },
     plugins: {
-      legend: { display:false },
+      legend: { display: false },
       tooltip: {
         backgroundColor: '#1e293b', borderColor: color, borderWidth: 1,
         titleColor: '#94a3b8', bodyColor: '#f1f5f9',
         padding: 10, cornerRadius: 8,
-        titleFont: { family:'JetBrains Mono', size:9 },
-        bodyFont: { family:'JetBrains Mono', size:11, weight:'600' },
-        callbacks: {
-          label: ctx => ` ${ctx.parsed.y?.toFixed(2)} ${yLabel}`
-        }
+        titleFont: { family: 'JetBrains Mono', size: 9 },
+        bodyFont:  { family: 'JetBrains Mono', size: 11, weight: '600' },
+        callbacks: { label: ctx => ` ${ctx.parsed.y?.toFixed(2)} ${yLabel}` }
       }
     },
     scales: {
       x: {
-        ticks: { color:'#94a3b8', font:{size:8,family:'JetBrains Mono'}, maxTicksLimit:5, maxRotation:0 },
-        grid:  { color:'rgba(148,163,184,0.10)' },
-        border:{ color:'#e2e8f0' }
+        ticks: { color: '#94a3b8', font: { size: 8, family: 'JetBrains Mono' }, maxTicksLimit: 5, maxRotation: 0 },
+        grid:  { color: 'rgba(148,163,184,0.10)' },
+        border:{ color: '#e2e8f0' }
       },
       y: {
-        ticks: { color:'#94a3b8', font:{size:9,family:'JetBrains Mono'} },
-        grid:  { color:'rgba(148,163,184,0.10)' },
-        border:{ color:'#e2e8f0' },
+        ticks: { color: '#94a3b8', font: { size: 9, family: 'JetBrains Mono' } },
+        grid:  { color: 'rgba(148,163,184,0.10)' },
+        border:{ color: '#e2e8f0' },
         ...extra
       }
     }
   };
 }
 
-// Chart 1 — Getaran: area chart, indigo, with threshold annotation feel
 function mkGetaran(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#4F46E5';
-  return new Chart(ctx, {
-    type: 'line',
-    data: { labels:[], datasets:[{
-      label:'Getaran', data:[],
-      borderColor: color, backgroundColor: color+'22',
-      borderWidth: 2, tension: 0.4, fill: true,
-      pointRadius: 2.5, pointHoverRadius: 5,
-      pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2
-    }]},
-    options: baseOpts('mm/s', color)
-  });
+  return new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Getaran', data: [], borderColor: color, backgroundColor: color + '22', borderWidth: 2, tension: 0.4, fill: true, pointRadius: 2.5, pointHoverRadius: 5, pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2 }]}, options: baseOpts('mm/s', color) });
 }
 
-// Chart 2 — Arus: bar chart, cyan
 function mkArus(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#0891b2';
-  return new Chart(ctx, {
-    type: 'bar',
-    data: { labels:[], datasets:[{
-      label:'Arus', data:[],
-      backgroundColor: color+'33',
-      borderColor: color,
-      borderWidth: 1.5,
-      borderRadius: 4,
-      borderSkipped: false,
-      hoverBackgroundColor: color+'55'
-    }]},
-    options: baseOpts('A', color)
-  });
+  return new Chart(ctx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Arus', data: [], backgroundColor: color + '33', borderColor: color, borderWidth: 1.5, borderRadius: 4, borderSkipped: false, hoverBackgroundColor: color + '55' }]}, options: baseOpts('A', color) });
 }
 
-// Chart 3 — Suhu N1: stepped line, emerald
 function mkSuhuN1(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#059669';
-  return new Chart(ctx, {
-    type: 'line',
-    data: { labels:[], datasets:[{
-      label:'Suhu Mesin', data:[],
-      borderColor: color, backgroundColor: color+'18',
-      borderWidth: 2, stepped: 'middle', fill: true,
-      pointRadius: 2, pointHoverRadius: 5,
-      pointBackgroundColor: color, pointBorderColor:'#fff', pointBorderWidth:1.5
-    }]},
-    options: baseOpts('°C', color)
-  });
+  return new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Suhu Mesin', data: [], borderColor: color, backgroundColor: color + '18', borderWidth: 2, stepped: 'middle', fill: true, pointRadius: 2, pointHoverRadius: 5, pointBackgroundColor: color, pointBorderColor: '#fff', pointBorderWidth: 1.5 }]}, options: baseOpts('°C', color) });
 }
 
-// Chart 4 — Suhu N2: smooth area, amber, dual-tone fill
 function mkSuhuN2(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#d97706';
   return new Chart(ctx, {
     type: 'line',
-    data: { labels:[], datasets:[{
-      label:'Suhu Ruang', data:[],
-      borderColor: color,
+    data: { labels: [], datasets: [{ label: 'Suhu Ruang', data: [], borderColor: color,
       backgroundColor: (ctx2) => {
-        const c = ctx2.chart.ctx, h = ctx2.chart.chartArea?.bottom||200;
-        const g = c.createLinearGradient(0,0,0,h);
-        g.addColorStop(0, color+'44'); g.addColorStop(1, color+'05');
-        return g;
+        const c = ctx2.chart.ctx, h = ctx2.chart.chartArea?.bottom || 200;
+        const g = c.createLinearGradient(0, 0, 0, h);
+        g.addColorStop(0, color + '44'); g.addColorStop(1, color + '05'); return g;
       },
-      borderWidth: 2.5, tension: 0.5, fill: true,
-      pointRadius: 0, pointHoverRadius: 5,
-      pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2
+      borderWidth: 2.5, tension: 0.5, fill: true, pointRadius: 0, pointHoverRadius: 5, pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2
     }]},
     options: baseOpts('°C', color)
   });
 }
 
-// Chart 5 — Gas: bar chart, rose/red, danger feel
-// NB: warna per-bar di-generate saat updateCharts (bukan scriptable callback)
-//     karena ctx2.parsed belum tersedia saat chart kosong di init
 function mkGas(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#dc2626';
-  return new Chart(ctx, {
-    type: 'bar',
-    data: { labels:[], datasets:[{
-      label:'Gas/Asap', data:[],
-      backgroundColor: [],   // diisi array per update
-      borderColor:     [],   // diisi array per update
-      borderWidth: 1.5,
-      borderRadius: 3,
-      borderSkipped: false,
-      hoverBackgroundColor: color+'66'
-    }]},
-    options: baseOpts('ppm', color)
-  });
+  return new Chart(ctx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Gas/Asap', data: [], backgroundColor: [], borderColor: [], borderWidth: 1.5, borderRadius: 3, borderSkipped: false, hoverBackgroundColor: color + '66' }]}, options: baseOpts('ppm', color) });
 }
 
-// Chart 6 — Kelembaban: smooth line, violet, no fill, dashed
 function mkHum(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#7c3aed';
-  return new Chart(ctx, {
-    type: 'line',
-    data: { labels:[], datasets:[{
-      label:'Kelembaban', data:[],
-      borderColor: color,
-      backgroundColor: 'transparent',
-      borderWidth: 2, borderDash: [6,3],
-      tension: 0.45, fill: false,
-      pointRadius: 3, pointHoverRadius: 6,
-      pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2
-    }]},
-    options: baseOpts('%', color)
-  });
+  return new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Kelembaban', data: [], borderColor: color, backgroundColor: 'transparent', borderWidth: 2, borderDash: [6, 3], tension: 0.45, fill: false, pointRadius: 3, pointHoverRadius: 6, pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2 }]}, options: baseOpts('%', color) });
 }
 
 let charts = {};
@@ -285,7 +289,6 @@ window.addEventListener('DOMContentLoaded', () => {
   charts.suhuN2  = mkSuhuN2('chart-suhu-n2');
   charts.gas     = mkGas('chart-gas');
   charts.hum     = mkHum('chart-hum');
-  // keep legacy refs so nothing else breaks
   window.__sf.cN1 = charts.getaran;
   window.__sf.cN2 = charts.suhuN2;
 });
@@ -294,7 +297,7 @@ function updateCharts(docs) {
   if (!docs.length) return;
   const labels = docs.map(d => {
     const dt = new Date(d.time);
-    return isNaN(dt) ? d.id?.split('_')[1]||'' : dt.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    return isNaN(dt) ? (d.id?.split('_')[1] || '') : dt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   });
 
   const upd = (key, fn) => {
@@ -310,20 +313,11 @@ function updateCharts(docs) {
   upd('suhuN2',  d => d.suhu_n2 ?? 0);
   upd('hum',     d => d.hum     ?? 0);
 
-  // Gas — update dengan array warna per-bar berdasarkan threshold
   const cGas = charts.gas;
   if (cGas) {
-    const gasVals = docs.map(d => d.gas ?? 0);
-    const bgColors = gasVals.map(v => {
-      if (v >= 300) return '#dc262655';
-      if (v >= 250) return '#f59e0b44';
-      return '#dc262620';
-    });
-    const bdColors = gasVals.map(v => {
-      if (v >= 300) return '#dc2626';
-      if (v >= 250) return '#f59e0b';
-      return '#dc2626aa';
-    });
+    const gasVals  = docs.map(d => d.gas ?? 0);
+    const bgColors = gasVals.map(v => v >= 300 ? '#dc262655' : v >= 250 ? '#f59e0b44' : '#dc262620');
+    const bdColors = gasVals.map(v => v >= 300 ? '#dc2626'   : v >= 250 ? '#f59e0b'   : '#dc2626aa');
     cGas.data.labels = labels;
     cGas.data.datasets[0].data            = gasVals;
     cGas.data.datasets[0].backgroundColor = bgColors;
@@ -332,46 +326,51 @@ function updateCharts(docs) {
   }
 }
 
+// ── Render Log ─────────────────────────────────────────────────
 function renderLog(docs) {
   const tb = document.getElementById('log-tbody');
   if (!tb) return;
-  tb.innerHTML = docs.map(d=>`<tr>
+  tb.innerHTML = docs.map(d => `<tr>
     <td class="mc">${d.ts}</td>
-    <td>${fv(d.getaran,'mm/s')}</td>
-    <td>${fv(d.arus,'A')}</td>
-    <td>${fv(d.suhu_n1,'°C')}</td>
-    <td>${fv(d.suhu_n2,'°C')}</td>
-    <td>${fv(d.gas,'ppm')}</td>
-    <td>${fv(d.hum,'%')}</td>
+    <td>${d.hasN1 ? fv(d.getaran,'mm/s') : '<span class="dim">N/A</span>'}</td>
+    <td>${d.hasN1 ? fv(d.arus,'A')       : '<span class="dim">N/A</span>'}</td>
+    <td>${d.hasN1 ? fv(d.suhu_n1,'°C')   : '<span class="dim">N/A</span>'}</td>
+    <td>${d.hasN2 ? fv(d.suhu_n2,'°C')   : '<span class="dim">N/A</span>'}</td>
+    <td>${d.hasN2 ? fv(d.gas,'ppm')       : '<span class="dim">N/A</span>'}</td>
+    <td>${d.hasN2 ? fv(d.hum,'%')         : '<span class="dim">N/A</span>'}</td>
     <td><span class="lpill lp-${d.status}">${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'}</span></td>
   </tr>`).join('');
-  document.getElementById('log-count').textContent = docs.length+' entri';
+  document.getElementById('log-count').textContent = docs.length + ' entri';
 }
 
+// ── Render Alarm ───────────────────────────────────────────────
 function renderAlarms(docs) {
   const el = document.getElementById('alarm-list');
   if (!el) return;
-  const nc = docs.filter(d=>d.status==='crit').length;
-  const nw = docs.filter(d=>d.status==='warn').length;
+  const nc = docs.filter(d => d.status === 'crit').length;
+  const nw = docs.filter(d => d.status === 'warn').length;
   document.getElementById('s-crit').textContent  = nc;
   document.getElementById('s-warn').textContent  = nw;
   document.getElementById('s-total').textContent = docs.length;
   const nb = document.getElementById('alarm-badge');
-  if (nb) { nb.textContent=docs.length; nb.style.display=docs.length?'inline-flex':'none'; }
+  if (nb) { nb.textContent = docs.length; nb.style.display = docs.length ? 'inline-flex' : 'none'; }
   if (!docs.length) {
-    el.innerHTML=`<div class="empty-st"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg><p>Semua sistem berjalan normal</p></div>`;
+    el.innerHTML = `<div class="empty-st"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg><p>Semua sistem berjalan normal</p></div>`;
     return;
   }
-  el.innerHTML = docs.map(d=>{
-    const tg=[];
-    if(d.leak_env)   tg.push('Kebocoran Gas');
-    if(d.anom_mach)  tg.push('Anomali Mesin');
-    if(d.suhu_n2>38) tg.push(`Suhu ${parseFloat(d.suhu_n2).toFixed(1)}°C`);
-    if(d.gas>250)    tg.push(`Gas ${parseFloat(d.gas).toFixed(0)} ppm`);
+  el.innerHTML = docs.map(d => {
+    const tg = [];
+    if (d.leak_env)   tg.push('Kebocoran Gas');
+    if (d.anom_mach)  tg.push('Anomali Mesin');
+    if (d.suhu_n2 > 38) tg.push(`Suhu Ruang ${parseFloat(d.suhu_n2).toFixed(1)}°C`);
+    if (d.suhu_n1 > 38) tg.push(`Suhu Mesin ${parseFloat(d.suhu_n1).toFixed(1)}°C`);
+    if (d.gas > 250) tg.push(`Gas ${parseFloat(d.gas).toFixed(0)} ppm`);
+    if (d.getaran > 2.0) tg.push(`Getaran ${parseFloat(d.getaran).toFixed(2)} mm/s`);
+    if (d.arus > 4.0) tg.push(`Arus ${parseFloat(d.arus).toFixed(2)} A`);
     return `<div class="alarm-row ar-${d.status}">
       <div class="ar-left">
-        <span class="ar-badge arb-${d.status}">${d.status==='crit'?'ANOMALI':'WARNING'}</span>
-        <span class="ar-tags">${tg.map(t=>`<span>${t}</span>`).join('')}</span>
+        <span class="ar-badge arb-${d.status}">${d.status === 'crit' ? 'ANOMALI' : 'WARNING'}</span>
+        <span class="ar-tags">${tg.map(t => `<span>${t}</span>`).join('')}</span>
       </div>
       <span class="ar-ts mc">${d.ts}</span>
     </div>`;
@@ -379,58 +378,81 @@ function renderAlarms(docs) {
 }
 
 function updateSB(d) {
-  sbState(d.status, `LIVE · RTDB · ${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'} · ${d.ts}`);
+  sbState(d.status, `LIVE · RTDB · ${d.status === 'ok' ? 'NORMAL' : d.status === 'warn' ? 'WARNING' : 'ANOMALI'} · ${d.ts}`);
 }
 function sbState(st, msg) {
-  const bar=document.getElementById('sb'); const txt=document.getElementById('sb-txt');
-  if(bar) bar.className=`sb sb-${st}`;
-  if(txt) txt.textContent=msg;
+  const bar = document.getElementById('sb');
+  const txt = document.getElementById('sb-txt');
+  if (bar) bar.className = `sb sb-${st}`;
+  if (txt) txt.textContent = msg;
 }
 
+// ── Test Insert (Preset & Custom) ─────────────────────────────
 const PRESETS = [
-  {label:'Normal',      data:{getaran:1.8, arus:3.2, suhu_m:35, suhu_e:28, hum:72, gas:180, am:false, ke:false}},
-  {label:'Warning Suhu',data:{getaran:2.1, arus:3.5, suhu_m:40, suhu_e:32, hum:65, gas:260, am:false, ke:false}},
-  {label:'Anomali Gas', data:{getaran:2.4, arus:3.7, suhu_m:41, suhu_e:33, hum:68, gas:318, am:false, ke:true }},
-  {label:'Full Anomali',data:{getaran:3.5, arus:5.2, suhu_m:50, suhu_e:38, hum:90, gas:420, am:true,  ke:true }},
+  { label: 'Normal',       data: { getaran: 1.8, arus: 3.2, suhu_m: 35, suhu_e: 28, hum: 72, gas: 180, am: false, ke: false } },
+  { label: 'Warning Suhu', data: { getaran: 2.1, arus: 3.5, suhu_m: 40, suhu_e: 32, hum: 65, gas: 260, am: false, ke: false } },
+  { label: 'Anomali Gas',  data: { getaran: 2.4, arus: 3.7, suhu_m: 41, suhu_e: 33, hum: 68, gas: 318, am: false, ke: true  } },
+  { label: 'Full Anomali', data: { getaran: 3.5, arus: 5.2, suhu_m: 50, suhu_e: 38, hum: 90, gas: 420, am: true,  ke: true  } },
 ];
+
+// Path key sama persis dengan Node 3: tanggal/jam_menit_detik_millis4digit
 function pathNow() {
-  const n=new Date(), tgl=n.toISOString().split('T')[0];
-  const jam=n.toTimeString().split(' ')[0].replace(/:/g,'_');
-  return {tgl,jam,full:`${tgl} ${n.toTimeString().split(' ')[0]}`};
+  const n   = new Date();
+  const tgl = n.toISOString().split('T')[0];
+  const hms = n.toTimeString().split(' ')[0].replace(/:/g, '_');
+  const ms4 = String(n.getTime() % 10000).padStart(4, '0');
+  const key = `${hms}_${ms4}`;
+  const full= `${tgl} ${n.toTimeString().split(' ')[0]}`;
+  return { tgl, key, full };
 }
-window.sendPreset = async i => {
-  const p=PRESETS[i].data, t=pathNow();
+
+window.sendPreset = async (i) => {
+  const p = PRESETS[i].data, t = pathNow();
   try {
-    await set(ref(db,`factory_data/${t.tgl}/${t.jam}`),{
-      waktu_lengkap:t.full,
-      node_machine:     {anomali:p.am, arus:p.arus, getaran:p.getaran, suhu:p.suhu_m},
-      node_environment: {gas:p.gas, humidity:p.hum, kebocoran:p.ke, suhu:p.suhu_e}
+    await set(ref(db, `factory_data/${t.tgl}/${t.key}`), {
+      waktu_lengkap:    t.full,
+      node_machine:     { anomali: p.am, arus: p.arus, getaran: p.getaran, suhu: p.suhu_m },
+      node_environment: { gas: p.gas, humidity: p.hum, kebocoran: p.ke, suhu: p.suhu_e }
     });
     toast(`Preset "${PRESETS[i].label}" dikirim`);
-  } catch(e){toast(e.message,true);}
-};
-window.sendCustom = async () => {
-  const g=id=>parseFloat(document.getElementById(id)?.value||'0'), t=pathNow();
-  const gas=g('i-gas'), suhu_m=g('i-suhu-m'), suhu_e=g('i-suhu-e');
-  try {
-    await set(ref(db,`factory_data/${t.tgl}/${t.jam}`),{
-      waktu_lengkap:t.full,
-      node_machine:     {anomali:false, arus:g('i-arus'), getaran:g('i-getaran'), suhu:suhu_m},
-      node_environment: {gas, humidity:g('i-hum'), kebocoran:(gas>300), suhu:suhu_e}
-    });
-    toast('Data custom berhasil dikirim');
-  } catch(e){toast(e.message,true);}
+  } catch (e) { toast(e.message, true); }
 };
 
-function fv(v,u) {
-  if(v==null) return `<span class="dim">—</span>`;
+window.sendCustom = async () => {
+  // Ambil nilai dari kedua input suhu (N1 & N2)
+  const g   = id => parseFloat(document.getElementById(id)?.value || '0');
+  const t   = pathNow();
+  const gas = g('i-gas');
+  const suhu_m = g('i-suhu-m');   // Suhu Mesin (Node 1)
+  const suhu_e = g('i-suhu-e');   // Suhu Ruang (Node 2)
+  const getaran = g('i-getaran');
+  const arus    = g('i-arus');
+  const hum     = g('i-hum');
+  // Tentukan anomali otomatis dari threshold
+  const am = getaran >= 3.0 || arus >= 5.0 || suhu_m >= 42;
+  const ke = gas >= 300;
+  try {
+    await set(ref(db, `factory_data/${t.tgl}/${t.key}`), {
+      waktu_lengkap:    t.full,
+      node_machine:     { anomali: am, arus, getaran, suhu: suhu_m },
+      node_environment: { gas, humidity: hum, kebocoran: ke, suhu: suhu_e }
+    });
+    toast('Data custom berhasil dikirim');
+  } catch (e) { toast(e.message, true); }
+};
+
+// ── Helper ─────────────────────────────────────────────────────
+function fv(v, u) {
+  if (v == null) return `<span class="dim">—</span>`;
   return `<span class="dn">${parseFloat(v).toFixed(2)}</span><span class="du"> ${u}</span>`;
 }
-function toast(msg,err=false) {
-  const t=document.getElementById('toast');
-  t.textContent=msg; t.className=`toast ${err?'t-err':'t-ok'}`;
-  t.style.opacity='1'; t.style.transform='translateY(0)';
-  setTimeout(()=>{t.style.opacity='0';t.style.transform='translateY(10px)'},3000);
+function toast(msg, err = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className   = `toast ${err ? 't-err' : 't-ok'}`;
+  t.style.opacity   = '1';
+  t.style.transform = 'translateY(0)';
+  setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateY(10px)'; }, 3000);
 }
 </script>
 
@@ -438,53 +460,41 @@ function toast(msg,err=false) {
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
 :root {
-  /* ── Warm Neutral Palette ── */
   --bg:       #F8F7F5;
   --bg-s:     #FFFFFF;
   --bg-c:     #FFFFFF;
   --bg-h:     #F1F0EE;
   --surface:  #FFFFFF;
-
   --b1:       #E8E5E0;
   --b2:       #D4D0CA;
   --b3:       #C0BCB5;
-
   --t1:       #1C1917;
   --t2:       #44403C;
   --t3:       #78716C;
   --t4:       #A8A29E;
-
-  /* ── Slate Blue Accent ── */
   --accent:   #4F46E5;
   --accent-h: #4338CA;
   --accent-s: #EEF2FF;
   --accent-b: #C7D2FE;
-
-  /* ── Semantic ── */
   --ok-tx:    #059669;
   --ok-bg:    #ECFDF5;
   --ok-br:    #A7F3D0;
-
   --warn-tx:  #D97706;
   --warn-bg:  #FFFBEB;
   --warn-br:  #FDE68A;
-
   --crit-tx:  #DC2626;
   --crit-bg:  #FEF2F2;
   --crit-br:  #FECACA;
-
   --font: 'Inter', system-ui, sans-serif;
   --mono: 'JetBrains Mono', monospace;
-
-  --nav-w:    240px;
+  --nav-w:     240px;
   --nav-w-col: 56px;
-  --sbh:      36px;
-  --r:        10px;
-  --r-sm:     6px;
-
-  --shadow-sm: 0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
-  --shadow:    0 4px 12px rgba(0,0,0,.07), 0 1px 3px rgba(0,0,0,.04);
-  --shadow-lg: 0 8px 24px rgba(0,0,0,.10), 0 2px 6px rgba(0,0,0,.05);
+  --sbh:       36px;
+  --r:         10px;
+  --r-sm:      6px;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --shadow:    0 4px 12px rgba(0,0,0,.07),0 1px 3px rgba(0,0,0,.04);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,.10),0 2px 6px rgba(0,0,0,.05);
 }
 
 html { font-size: 14px; }
@@ -496,490 +506,231 @@ body {
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
 }
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--b2);border-radius:9px}
 
-::-webkit-scrollbar { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--b2); border-radius: 9px; }
+/* STATUS BAR */
+.sb{position:sticky;top:0;z-index:300;height:var(--sbh);display:flex;align-items:center;gap:8px;padding:0 20px;font-family:var(--mono);font-size:9px;letter-spacing:1.2px;border-bottom:1px solid var(--b1);background:var(--bg-s);box-shadow:var(--shadow-sm);transition:background .3s,color .3s}
+.sb-ok       {color:var(--ok-tx);border-bottom-color:var(--ok-br)}
+.sb-warn     {color:var(--warn-tx);border-bottom-color:var(--warn-br);background:var(--warn-bg)}
+.sb-crit     {color:var(--crit-tx);border-bottom-color:var(--crit-br);background:var(--crit-bg);animation:bk .7s infinite}
+.sb-conn-err {color:var(--crit-tx);border-bottom-color:var(--crit-br)}
+.sb-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0;animation:pd 1.8s ease-in-out infinite}
+@keyframes pd{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.7);opacity:.5}}
+@keyframes bk{0%,100%{opacity:1}50%{opacity:.4}}
 
-/* ── STATUS BAR ─────────────────────────────────── */
-.sb {
-  position: sticky; top: 0; z-index: 300;
-  height: var(--sbh);
-  display: flex; align-items: center; gap: 8px;
-  padding: 0 20px;
-  font-family: var(--mono); font-size: 9px;
-  letter-spacing: 1.2px;
-  border-bottom: 1px solid var(--b1);
-  background: var(--bg-s);
-  box-shadow: var(--shadow-sm);
-  transition: background .3s, color .3s;
-}
-.sb-ok        { color: var(--ok-tx);   border-bottom-color: var(--ok-br); }
-.sb-warn      { color: var(--warn-tx); border-bottom-color: var(--warn-br); background: var(--warn-bg); }
-.sb-crit      { color: var(--crit-tx); border-bottom-color: var(--crit-br); background: var(--crit-bg); animation: bk .7s infinite; }
-.sb-conn-err  { color: var(--crit-tx); border-bottom-color: var(--crit-br); }
+/* LAYOUT */
+.shell{display:flex;height:calc(100vh - var(--sbh))}
 
-.sb-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: currentColor; flex-shrink: 0;
-  animation: pd 1.8s ease-in-out infinite;
-}
-@keyframes pd { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.7);opacity:.5} }
-@keyframes bk { 0%,100%{opacity:1} 50%{opacity:.4} }
+/* SIDEBAR */
+.side{width:var(--nav-w);flex-shrink:0;background:var(--bg-s);border-right:1px solid var(--b1);display:flex;flex-direction:column;position:sticky;top:var(--sbh);height:calc(100vh - var(--sbh));overflow:hidden;transition:width .22s cubic-bezier(.4,0,.2,1);box-shadow:var(--shadow-sm)}
+.side.collapsed{width:var(--nav-w-col)}
+.side-brand{padding:16px 14px;border-bottom:1px solid var(--b1);display:flex;align-items:center;gap:10px;min-height:62px;flex-shrink:0}
+.brand-sq{width:30px;height:30px;border-radius:8px;flex-shrink:0;background:var(--accent);display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(79,70,229,.25)}
+.brand-text{overflow:hidden;white-space:nowrap}
+.brand-name{font-size:13px;font-weight:600;color:var(--t1);letter-spacing:-.3px}
+.brand-id{font-size:9px;color:var(--t4);font-family:var(--mono);letter-spacing:.6px;margin-top:1px}
+.side-toggle{width:26px;height:26px;border-radius:6px;border:1px solid var(--b1);background:var(--bg);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-left:auto;transition:background .12s,border-color .12s;color:var(--t3)}
+.side-toggle:hover{background:var(--accent-s);border-color:var(--accent-b);color:var(--accent)}
+.side.collapsed .side-toggle{margin-left:0}
+.toggle-icon{transition:transform .22s}
+.side.collapsed .toggle-icon{transform:rotate(180deg)}
+.nav-grp{padding:10px 0 0}
+.nav-grp-label{padding:0 14px 4px;font-size:8px;color:var(--t4);letter-spacing:1.4px;text-transform:uppercase;font-weight:600;white-space:nowrap;overflow:hidden;transition:opacity .15s}
+.side.collapsed .nav-grp-label{opacity:0}
+.nb{display:flex;align-items:center;gap:10px;padding:8px 14px;width:100%;text-align:left;background:transparent;border:none;border-left:2px solid transparent;cursor:pointer;font-family:var(--font);font-size:12px;color:var(--t3);transition:all .12s;white-space:nowrap;position:relative}
+.nb:hover{color:var(--t1);background:var(--bg-h)}
+.nb.on{color:var(--accent);background:var(--accent-s);border-left-color:var(--accent);font-weight:500}
+.nb-ico{width:16px;height:16px;flex-shrink:0}
+.nb-txt{overflow:hidden;transition:opacity .15s}
+.side.collapsed .nb-txt{opacity:0;pointer-events:none}
+.side.collapsed .nb{justify-content:center;padding:8px 0;border-left:2px solid transparent}
+.side.collapsed .nb.on{border-left-color:transparent}
+.side.collapsed .nb::after{content:attr(data-tip);position:absolute;left:calc(var(--nav-w-col) + 6px);top:50%;transform:translateY(-50%);background:var(--t1);color:#fff;font-size:11px;padding:4px 9px;border-radius:5px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .15s;z-index:99}
+.side.collapsed .nb:hover::after{opacity:1}
+.n-badge{display:none;margin-left:auto;background:var(--crit-bg);color:var(--crit-tx);border:1px solid var(--crit-br);font-size:9px;font-family:var(--mono);padding:1px 6px;border-radius:20px;font-weight:600}
+.side.collapsed .n-badge{display:none!important}
+.side-nodes{padding:8px 14px}
+.side.collapsed .side-nodes{display:none}
+.sn-row{display:flex;align-items:center;gap:8px;padding:5px 0}
+.sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.sd-ok  {background:var(--ok-tx);box-shadow:0 0 6px rgba(5,150,105,.3);animation:pd 2.2s ease-in-out infinite}
+.sd-crit{background:var(--crit-tx);box-shadow:0 0 6px rgba(220,38,38,.4);animation:bk .6s infinite}
+.sn-name{font-size:11px;color:var(--t2)}
+.sn-tag {margin-left:auto;font-size:9px;color:var(--t4);font-family:var(--mono)}
+.side-foot{margin-top:auto;padding:12px 14px;border-top:1px solid var(--b1);overflow:hidden}
+.side.collapsed .side-foot{padding:12px 0;text-align:center}
+.sf-label{font-size:8px;color:var(--t4);letter-spacing:.8px;text-transform:uppercase;font-family:var(--mono)}
+.sf-val{font-size:9px;color:var(--t3);font-family:var(--mono);margin-top:3px;white-space:nowrap}
+.side.collapsed .sf-label,.side.collapsed .sf-val{display:none}
 
-/* ── LAYOUT ─────────────────────────────────────── */
-.shell { display: flex; height: calc(100vh - var(--sbh)); }
+/* MAIN */
+.main{flex:1;overflow-y:auto;padding:24px 28px;background:var(--bg)}
+.pg{display:none}
+.pg.on{display:block}
 
-/* ── SIDEBAR ────────────────────────────────────── */
-.side {
-  width: var(--nav-w);
-  flex-shrink: 0;
-  background: var(--bg-s);
-  border-right: 1px solid var(--b1);
-  display: flex;
-  flex-direction: column;
-  position: sticky;
-  top: var(--sbh);
-  height: calc(100vh - var(--sbh));
-  overflow: hidden;
-  transition: width .22s cubic-bezier(.4,0,.2,1);
-  box-shadow: var(--shadow-sm);
-}
-.side.collapsed { width: var(--nav-w-col); }
+/* PAGE HEADER */
+.ph{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid var(--b1)}
+.ph-title{font-size:18px;font-weight:600;color:var(--t1);letter-spacing:-.5px}
+.ph-sub{font-size:12px;color:var(--t3);margin-top:3px}
+.ph-meta{text-align:right}
+.ph-meta-l{font-size:9px;color:var(--t4);text-transform:uppercase;letter-spacing:.8px;font-family:var(--mono)}
+.ph-meta-v{font-size:12px;color:var(--accent);font-family:var(--mono);margin-top:3px;font-weight:500}
 
-/* Brand */
-.side-brand {
-  padding: 16px 14px;
-  border-bottom: 1px solid var(--b1);
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 62px;
-  flex-shrink: 0;
-}
-.brand-sq {
-  width: 30px; height: 30px;
-  border-radius: 8px;
-  flex-shrink: 0;
-  background: var(--accent);
-  display: flex; align-items: center; justify-content: center;
-  box-shadow: 0 2px 8px rgba(79,70,229,.25);
-}
-.brand-text { overflow: hidden; white-space: nowrap; }
-.brand-name { font-size: 13px; font-weight: 600; color: var(--t1); letter-spacing: -.3px; }
-.brand-id   { font-size: 9px; color: var(--t4); font-family: var(--mono); letter-spacing: .6px; margin-top: 1px; }
+/* SECTION HEADER */
+.sh{display:flex;align-items:center;gap:10px;margin:20px 0 12px}
+.sh:first-of-type{margin-top:0}
+.sh-line{flex:1;height:1px;background:var(--b1)}
+.sh-label{font-size:9px;color:var(--t4);letter-spacing:1.2px;text-transform:uppercase;font-weight:600;white-space:nowrap}
+.node-tag{font-size:9px;font-family:var(--mono);font-weight:600;letter-spacing:.5px;padding:3px 8px;border-radius:var(--r-sm);text-transform:uppercase}
+.nt-1{background:var(--accent-s);color:var(--accent);border:1px solid var(--accent-b)}
+.nt-2{background:#FFFBEB;color:#D97706;border:1px solid #FDE68A}
 
-/* Toggle button */
-.side-toggle {
-  width: 26px; height: 26px;
-  border-radius: 6px;
-  border: 1px solid var(--b1);
-  background: var(--bg);
-  cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  margin-left: auto;
-  transition: background .12s, border-color .12s;
-  color: var(--t3);
-}
-.side-toggle:hover { background: var(--accent-s); border-color: var(--accent-b); color: var(--accent); }
-.side.collapsed .side-toggle { margin-left: 0; }
-.toggle-icon { transition: transform .22s; }
-.side.collapsed .toggle-icon { transform: rotate(180deg); }
+/* BANNER */
+.banner{display:none;align-items:center;gap:10px;padding:10px 14px;border-radius:var(--r);margin-bottom:16px;font-size:12px;border:1px solid;font-weight:500}
+.bn-warn{background:var(--warn-bg);border-color:var(--warn-br);color:var(--warn-tx)}
+.bn-crit{background:var(--crit-bg);border-color:var(--crit-br);color:var(--crit-tx)}
+.banner-ico{flex-shrink:0}
 
-/* Nav groups */
-.nav-grp { padding: 10px 0 0; }
-.nav-grp-label {
-  padding: 0 14px 4px;
-  font-size: 8px; color: var(--t4);
-  letter-spacing: 1.4px; text-transform: uppercase; font-weight: 600;
-  white-space: nowrap; overflow: hidden;
-  transition: opacity .15s;
-}
-.side.collapsed .nav-grp-label { opacity: 0; }
+/* KPI CARDS */
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:8px}
+.kpi-card{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:16px;box-shadow:var(--shadow-sm);transition:border-color .2s,box-shadow .2s;position:relative;overflow:hidden}
+.kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--b1);transition:background .2s}
+.kpi-card:hover{border-color:var(--b2);box-shadow:var(--shadow)}
+.kc-ok::before  {background:var(--ok-tx)}
+.kc-warn        {background:var(--warn-bg);border-color:var(--warn-br)}
+.kc-warn::before{background:var(--warn-tx)}
+.kc-crit        {background:var(--crit-bg);border-color:var(--crit-br)}
+.kc-crit::before{background:var(--crit-tx)}
+.kpi-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
+.kpi-label{font-size:11px;color:var(--t3);letter-spacing:.1px;display:flex;align-items:center;gap:5px}
+.kpi-label svg{opacity:.6}
+.cb{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;letter-spacing:.4px;font-family:var(--mono)}
+.st-badge-ok  {background:var(--ok-bg);  color:var(--ok-tx);  border:1px solid var(--ok-br)}
+.st-badge-warn{background:var(--warn-bg);color:var(--warn-tx);border:1px solid var(--warn-br)}
+.st-badge-crit{background:var(--crit-bg);color:var(--crit-tx);border:1px solid var(--crit-br)}
+.cv{font-size:28px;font-weight:700;line-height:1;letter-spacing:-1.5px;color:var(--t1)}
+.kc-warn .cv{color:var(--warn-tx)}
+.kc-crit .cv{color:var(--crit-tx)}
+.cu{font-size:11px;color:var(--t3);margin-left:3px;font-weight:400}
 
-.nb {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 14px;
-  width: 100%; text-align: left;
-  background: transparent; border: none;
-  border-left: 2px solid transparent;
-  cursor: pointer;
-  font-family: var(--font); font-size: 12px; color: var(--t3);
-  transition: all .12s;
-  white-space: nowrap;
-  position: relative;
-}
-.nb:hover { color: var(--t1); background: var(--bg-h); }
-.nb.on {
-  color: var(--accent);
-  background: var(--accent-s);
-  border-left-color: var(--accent);
-  font-weight: 500;
-}
-.nb-ico { width: 16px; height: 16px; flex-shrink: 0; }
-.nb-txt { overflow: hidden; transition: opacity .15s; }
-.side.collapsed .nb-txt { opacity: 0; pointer-events: none; }
-.side.collapsed .nb { justify-content: center; padding: 8px 0; border-left: 2px solid transparent; }
-.side.collapsed .nb.on { border-left-color: transparent; border-radius: 0; }
+/* CHARTS */
+.chart-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:8px}
+@media(max-width:1100px){.chart-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px) {.chart-grid{grid-template-columns:1fr}}
+.chart-box{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:16px;box-shadow:var(--shadow-sm);transition:box-shadow .2s,border-color .2s;position:relative;overflow:hidden}
+.chart-box::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--chart-color,var(--b2));border-radius:var(--r) var(--r) 0 0}
+.chart-box:hover{box-shadow:var(--shadow);border-color:var(--b2)}
+.chart-box.ch-getaran{--chart-color:#4F46E5}
+.chart-box.ch-arus   {--chart-color:#0891b2}
+.chart-box.ch-suhu-n1{--chart-color:#059669}
+.chart-box.ch-suhu-n2{--chart-color:#d97706}
+.chart-box.ch-gas    {--chart-color:#dc2626}
+.chart-box.ch-hum    {--chart-color:#7c3aed}
+.cb-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.cb-icon{width:28px;height:28px;border-radius:7px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--chart-color) 10%,transparent);border:1px solid color-mix(in srgb,var(--chart-color) 25%,transparent)}
+.cb-info{flex:1;min-width:0}
+.cb-title{font-size:11px;font-weight:600;color:var(--t1)}
+.cb-sub{font-size:9px;color:var(--t4);font-family:var(--mono);margin-top:1px}
+.cb-type{font-size:8px;font-family:var(--mono);font-weight:600;letter-spacing:.5px;padding:2px 7px;border-radius:20px;text-transform:uppercase;background:color-mix(in srgb,var(--chart-color) 10%,transparent);color:var(--chart-color);border:1px solid color-mix(in srgb,var(--chart-color) 20%,transparent);flex-shrink:0}
+.cw{position:relative;height:150px}
+.cf{font-size:8px;color:var(--t4);margin-top:7px;font-family:var(--mono);letter-spacing:.2px}
 
-/* Tooltip on collapsed */
-.side.collapsed .nb::after {
-  content: attr(data-tip);
-  position: absolute; left: calc(var(--nav-w-col) + 6px); top: 50%;
-  transform: translateY(-50%);
-  background: var(--t1); color: #fff;
-  font-size: 11px; padding: 4px 9px; border-radius: 5px;
-  white-space: nowrap; pointer-events: none; opacity: 0;
-  transition: opacity .15s;
-  z-index: 99;
-}
-.side.collapsed .nb:hover::after { opacity: 1; }
+/* NODE CARDS */
+.node-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+@media(max-width:700px){.node-row{grid-template-columns:1fr}}
+.node-c{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:14px;display:flex;align-items:center;gap:12px;box-shadow:var(--shadow-sm);transition:box-shadow .2s}
+.node-c:hover{box-shadow:var(--shadow)}
+.nc-ico{width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.ni-1{background:var(--accent-s);border:1px solid var(--accent-b)}
+.ni-2{background:#FFFBEB;border:1px solid #FDE68A}
+.ni-3{background:#F5F3FF;border:1px solid #DDD6FE}
+.nc-body{flex:1;min-width:0}
+.nc-name{font-size:12px;font-weight:500;color:var(--t1)}
+.nc-desc{font-size:10px;color:var(--t3);margin-top:2px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nc-st{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--t3)}
 
-.n-badge {
-  display: none; margin-left: auto;
-  background: var(--crit-bg); color: var(--crit-tx);
-  border: 1px solid var(--crit-br);
-  font-size: 9px; font-family: var(--mono); padding: 1px 6px; border-radius: 20px;
-  font-weight: 600;
-}
-.side.collapsed .n-badge { display: none !important; }
+/* DB STRIP */
+.db-strip{display:flex;flex-wrap:wrap;background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:12px 16px;margin-top:12px;gap:0;box-shadow:var(--shadow-sm)}
+.db-field{padding:4px 20px 4px 0;border-right:1px solid var(--b1);margin-right:20px}
+.db-field:last-child{border-right:none;margin-right:0}
+.db-lbl{font-size:9px;color:var(--t4);text-transform:uppercase;letter-spacing:1px;font-family:var(--mono)}
+.db-val{font-size:11px;color:var(--t2);font-family:var(--mono);margin-top:3px}
+.st-ok  {color:var(--ok-tx)  !important;font-weight:600}
+.st-warn{color:var(--warn-tx)!important;font-weight:600}
+.st-crit{color:var(--crit-tx)!important;font-weight:600}
 
-/* Node dots */
-.side-nodes { padding: 8px 14px; }
-.side.collapsed .side-nodes { display: none; }
-.sn-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
-.sdot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-.sd-ok   { background: var(--ok-tx); box-shadow: 0 0 6px rgba(5,150,105,.3); animation: pd 2.2s ease-in-out infinite; }
-.sd-crit { background: var(--crit-tx); box-shadow: 0 0 6px rgba(220,38,38,.4); animation: bk .6s infinite; }
-.sn-name { font-size: 11px; color: var(--t2); }
-.sn-tag  { margin-left: auto; font-size: 9px; color: var(--t4); font-family: var(--mono); }
+/* LOG TABLE */
+.table-wrap{overflow-x:auto;border-radius:var(--r);border:1px solid var(--b1);box-shadow:var(--shadow-sm)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead{position:sticky;top:0;z-index:1}
+th{background:var(--bg-h);color:var(--t4);font-weight:600;font-size:9px;letter-spacing:1px;text-transform:uppercase;padding:10px 14px;text-align:left;border-bottom:1px solid var(--b1);white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid var(--b1);color:var(--t2);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--bg-h)}
+.mc {font-family:var(--mono);font-size:10px;color:var(--t3);white-space:nowrap}
+.dn {color:var(--t1);font-weight:500}
+.du {font-size:10px;color:var(--t4)}
+.dim{color:var(--t4)}
+.lpill{font-size:9px;padding:2px 8px;border-radius:20px;font-weight:600;letter-spacing:.4px;font-family:var(--mono)}
+.lp-ok  {background:var(--ok-bg);  color:var(--ok-tx);  border:1px solid var(--ok-br)}
+.lp-warn{background:var(--warn-bg);color:var(--warn-tx);border:1px solid var(--warn-br)}
+.lp-crit{background:var(--crit-bg);color:var(--crit-tx);border:1px solid var(--crit-br)}
 
-/* Sidebar footer */
-.side-foot {
-  margin-top: auto;
-  padding: 12px 14px;
-  border-top: 1px solid var(--b1);
-  overflow: hidden;
-}
-.side.collapsed .side-foot { padding: 12px 0; text-align: center; }
-.sf-label { font-size: 8px; color: var(--t4); letter-spacing: .8px; text-transform: uppercase; font-family: var(--mono); }
-.sf-val   { font-size: 9px; color: var(--t3); font-family: var(--mono); margin-top: 3px; white-space: nowrap; }
-.side.collapsed .sf-label,
-.side.collapsed .sf-val { display: none; }
+/* ALARM PAGE */
+.alarm-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+.ak-card{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:16px;text-align:center;box-shadow:var(--shadow-sm)}
+.ak-n{font-size:32px;font-weight:700;line-height:1;font-family:var(--mono)}
+.ak-l{font-size:10px;color:var(--t3);margin-top:6px;text-transform:uppercase;letter-spacing:.8px}
+.ak-crit{border-top:3px solid var(--crit-tx)}.ak-crit .ak-n{color:var(--crit-tx)}
+.ak-warn{border-top:3px solid var(--warn-tx)}.ak-warn .ak-n{color:var(--warn-tx)}
+.alarm-row{border-radius:var(--r);border:1px solid;padding:12px 14px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--bg-c);box-shadow:var(--shadow-sm)}
+.ar-crit{border-left:3px solid var(--crit-tx);border-color:var(--crit-br);background:var(--crit-bg)}
+.ar-warn{border-left:3px solid var(--warn-tx);border-color:var(--warn-br);background:var(--warn-bg)}
+.ar-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ar-badge{font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 8px;border-radius:4px;font-family:var(--mono)}
+.arb-crit{background:var(--crit-bg);color:var(--crit-tx);border:1px solid var(--crit-br)}
+.arb-warn{background:var(--warn-bg);color:var(--warn-tx);border:1px solid var(--warn-br)}
+.ar-tags{display:flex;flex-wrap:wrap;gap:6px}
+.ar-tags span{font-size:11px;color:var(--t2)}
+.ar-ts{font-size:10px;color:var(--t3);font-family:var(--mono);white-space:nowrap;flex-shrink:0}
+.empty-st{text-align:center;padding:60px 0;color:var(--ok-tx)}
+.empty-st svg{display:block;margin:0 auto 10px}
+.empty-st p{font-size:13px;color:var(--t3)}
 
-/* ── MAIN ───────────────────────────────────────── */
-.main { flex: 1; overflow-y: auto; padding: 24px 28px; background: var(--bg); }
-.pg  { display: none; }
-.pg.on { display: block; }
+/* TEST PAGE */
+.test-info{background:var(--accent-s);border:1px solid var(--accent-b);border-left:3px solid var(--accent);border-radius:var(--r);padding:12px 16px;font-size:12px;color:var(--t2);line-height:1.7;margin-bottom:18px}
+.test-info code{font-family:var(--mono);color:var(--accent);font-size:11px;background:rgba(79,70,229,.08);padding:1px 4px;border-radius:3px}
+.preset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:18px}
+.preset-btn{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:14px 16px;cursor:pointer;text-align:left;font-family:var(--font);transition:border-color .12s,box-shadow .12s,transform .12s;box-shadow:var(--shadow-sm)}
+.preset-btn:hover{border-color:var(--b2);box-shadow:var(--shadow);transform:translateY(-1px)}
+.pb-l{font-size:13px;font-weight:500;margin-bottom:4px}
+.pb-d{font-size:10px;color:var(--t3);font-family:var(--mono)}
+.pb-0{border-top:2px solid var(--ok-tx)}.pb-0 .pb-l{color:var(--ok-tx)}
+.pb-1{border-top:2px solid var(--warn-tx)}.pb-1 .pb-l{color:var(--warn-tx)}
+.pb-2{border-top:2px solid var(--crit-tx)}.pb-2 .pb-l{color:var(--crit-tx)}
+.pb-3{border-top:2px solid var(--crit-tx)}.pb-3 .pb-l{color:var(--crit-tx)}
 
-/* ── PAGE HEADER ────────────────────────────────── */
-.ph {
-  display: flex; justify-content: space-between; align-items: flex-start;
-  margin-bottom: 22px; padding-bottom: 16px;
-  border-bottom: 1px solid var(--b1);
-}
-.ph-title { font-size: 18px; font-weight: 600; color: var(--t1); letter-spacing: -.5px; }
-.ph-sub   { font-size: 12px; color: var(--t3); margin-top: 3px; }
-.ph-meta  { text-align: right; }
-.ph-meta-l { font-size: 9px; color: var(--t4); text-transform: uppercase; letter-spacing: .8px; font-family: var(--mono); }
-.ph-meta-v { font-size: 12px; color: var(--accent); font-family: var(--mono); margin-top: 3px; font-weight: 500; }
+/* INPUT SECTION */
+.input-section-label{font-size:9px;color:var(--t4);letter-spacing:1.2px;text-transform:uppercase;font-weight:600;padding:14px 18px 8px;border-top:1px solid var(--b1)}
+.input-section-label:first-child{border-top:none;padding-top:0}
+.input-block{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow-sm)}
+.ir{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--b1)}
+.ir:last-of-type{border-bottom:none}
+.ir-l{font-size:12px;color:var(--t1);font-weight:500}
+.ir-u{font-size:10px;color:var(--t4);font-weight:400}
+.inp{width:120px;background:var(--bg);border:1px solid var(--b2);border-radius:var(--r-sm);color:var(--t1);font-size:13px;padding:7px 11px;text-align:right;font-family:var(--mono);outline:none;transition:border-color .12s,box-shadow .12s}
+.inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+.send-btn{width:100%;margin-top:0;background:var(--accent);border:none;border-radius:0 0 var(--r) var(--r);color:#fff;font-size:13px;font-weight:500;padding:12px;cursor:pointer;font-family:var(--font);transition:background .12s,transform .1s;display:block}
+.send-btn:hover{background:var(--accent-h)}
 
-/* ── SECTION HEADERS ────────────────────────────── */
-.sh { display: flex; align-items: center; gap: 10px; margin: 20px 0 12px; }
-.sh:first-of-type { margin-top: 0; }
-.sh-line  { flex: 1; height: 1px; background: var(--b1); }
-.sh-label { font-size: 9px; color: var(--t4); letter-spacing: 1.2px; text-transform: uppercase; font-weight: 600; white-space: nowrap; }
-.node-tag {
-  font-size: 9px; font-family: var(--mono); font-weight: 600; letter-spacing: .5px;
-  padding: 3px 8px; border-radius: var(--r-sm); text-transform: uppercase;
-}
-.nt-1 { background: var(--accent-s); color: var(--accent); border: 1px solid var(--accent-b); }
-.nt-2 { background: #FFFBEB; color: #D97706; border: 1px solid #FDE68A; }
+/* TOAST */
+.toast{position:fixed;bottom:20px;right:20px;z-index:9999;padding:10px 16px;border-radius:var(--r);border:1px solid;font-size:11px;font-family:var(--mono);letter-spacing:.3px;opacity:0;transform:translateY(10px);transition:opacity .2s,transform .2s;pointer-events:none;box-shadow:var(--shadow-lg)}
+.t-ok {background:var(--ok-bg); border-color:var(--ok-br); color:var(--ok-tx)}
+.t-err{background:var(--crit-bg);border-color:var(--crit-br);color:var(--crit-tx)}
 
-/* ── BANNER ─────────────────────────────────────── */
-.banner {
-  display: none; align-items: center; gap: 10px;
-  padding: 10px 14px; border-radius: var(--r);
-  margin-bottom: 16px; font-size: 12px; border: 1px solid;
-  font-weight: 500;
-}
-.bn-warn { background: var(--warn-bg); border-color: var(--warn-br); color: var(--warn-tx); }
-.bn-crit { background: var(--crit-bg); border-color: var(--crit-br); color: var(--crit-tx); }
-.banner-ico { flex-shrink: 0; }
-
-/* ── KPI CARDS ──────────────────────────────────── */
-.kpi-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-  gap: 10px; margin-bottom: 8px;
-}
-
-.kpi-card {
-  background: var(--bg-c);
-  border: 1px solid var(--b1);
-  border-radius: var(--r);
-  padding: 16px;
-  box-shadow: var(--shadow-sm);
-  transition: border-color .2s, box-shadow .2s;
-  position: relative;
-  overflow: hidden;
-}
-.kpi-card::before {
-  content: '';
-  position: absolute; top: 0; left: 0; right: 0; height: 3px;
-  background: var(--b1);
-  transition: background .2s;
-}
-.kpi-card:hover { border-color: var(--b2); box-shadow: var(--shadow); }
-
-.kc-ok::before   { background: var(--ok-tx); }
-.kc-warn         { background: var(--warn-bg); border-color: var(--warn-br); }
-.kc-warn::before { background: var(--warn-tx); }
-.kc-crit         { background: var(--crit-bg); border-color: var(--crit-br); }
-.kc-crit::before { background: var(--crit-tx); }
-
-.kpi-top   { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
-.kpi-label { font-size: 11px; color: var(--t3); letter-spacing: .1px; display: flex; align-items: center; gap: 5px; }
-.kpi-label svg { opacity: .6; }
-
-.cb { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600; letter-spacing: .4px; font-family: var(--mono); }
-.st-badge-ok   { background: var(--ok-bg);   color: var(--ok-tx);   border: 1px solid var(--ok-br); }
-.st-badge-warn { background: var(--warn-bg);  color: var(--warn-tx); border: 1px solid var(--warn-br); }
-.st-badge-crit { background: var(--crit-bg);  color: var(--crit-tx); border: 1px solid var(--crit-br); }
-
-.cv { font-size: 28px; font-weight: 700; line-height: 1; letter-spacing: -1.5px; color: var(--t1); }
-.kc-warn .cv { color: var(--warn-tx); }
-.kc-crit .cv { color: var(--crit-tx); }
-.cu { font-size: 11px; color: var(--t3); margin-left: 3px; font-weight: 400; }
-
-/* ── CHARTS ─────────────────────────────────────── */
-.chart-section-label {
-  font-size: 9px; color: var(--t4); letter-spacing: 1.2px;
-  text-transform: uppercase; font-weight: 600;
-  margin: 0 0 10px;
-}
-
-/* 3-col grid for 6 individual charts */
-.chart-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px; margin-bottom: 8px;
-}
-@media(max-width:1100px) { .chart-grid { grid-template-columns: repeat(2,1fr); } }
-@media(max-width:640px)  { .chart-grid { grid-template-columns: 1fr; } }
-
-.chart-box {
-  background: var(--bg-c); border: 1px solid var(--b1);
-  border-radius: var(--r); padding: 16px;
-  box-shadow: var(--shadow-sm);
-  transition: box-shadow .2s, border-color .2s;
-  position: relative; overflow: hidden;
-}
-.chart-box::before {
-  content: '';
-  position: absolute; top: 0; left: 0; right: 0; height: 3px;
-  background: var(--chart-color, var(--b2));
-  border-radius: var(--r) var(--r) 0 0;
-}
-.chart-box:hover { box-shadow: var(--shadow); border-color: var(--b2); }
-
-/* Per-chart accent colors */
-.chart-box.ch-getaran { --chart-color: #4F46E5; }
-.chart-box.ch-arus    { --chart-color: #0891b2; }
-.chart-box.ch-suhu-n1 { --chart-color: #059669; }
-.chart-box.ch-suhu-n2 { --chart-color: #d97706; }
-.chart-box.ch-gas     { --chart-color: #dc2626; }
-.chart-box.ch-hum     { --chart-color: #7c3aed; }
-
-.cb-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-.cb-icon {
-  width: 28px; height: 28px; border-radius: 7px; flex-shrink: 0;
-  display: flex; align-items: center; justify-content: center;
-  background: color-mix(in srgb, var(--chart-color) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--chart-color) 25%, transparent);
-}
-.cb-info { flex: 1; min-width: 0; }
-.cb-title { font-size: 11px; font-weight: 600; color: var(--t1); }
-.cb-sub   { font-size: 9px; color: var(--t4); font-family: var(--mono); margin-top: 1px; }
-.cb-type  {
-  font-size: 8px; font-family: var(--mono); font-weight: 600; letter-spacing: .5px;
-  padding: 2px 7px; border-radius: 20px; text-transform: uppercase;
-  background: color-mix(in srgb, var(--chart-color) 10%, transparent);
-  color: var(--chart-color);
-  border: 1px solid color-mix(in srgb, var(--chart-color) 20%, transparent);
-  flex-shrink: 0;
-}
-
-.cw { position: relative; height: 150px; }
-.cf { font-size: 8px; color: var(--t4); margin-top: 7px; font-family: var(--mono); letter-spacing: .2px; }
-
-/* ── NODE CARDS ─────────────────────────────────── */
-.node-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
-@media(max-width:700px) { .node-row { grid-template-columns: 1fr; } }
-
-.node-c {
-  background: var(--bg-c); border: 1px solid var(--b1); border-radius: var(--r);
-  padding: 14px; display: flex; align-items: center; gap: 12px;
-  box-shadow: var(--shadow-sm);
-  transition: box-shadow .2s;
-}
-.node-c:hover { box-shadow: var(--shadow); }
-.nc-ico {
-  width: 36px; height: 36px; border-radius: 9px;
-  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-}
-.ni-1 { background: var(--accent-s); border: 1px solid var(--accent-b); }
-.ni-2 { background: #FFFBEB; border: 1px solid #FDE68A; }
-.ni-3 { background: #F5F3FF; border: 1px solid #DDD6FE; }
-.nc-body  { flex: 1; min-width: 0; }
-.nc-name  { font-size: 12px; font-weight: 500; color: var(--t1); }
-.nc-desc  { font-size: 10px; color: var(--t3); margin-top: 2px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nc-st    { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--t3); }
-
-/* ── DB STRIP ───────────────────────────────────── */
-.db-strip {
-  display: flex; flex-wrap: wrap;
-  background: var(--bg-c); border: 1px solid var(--b1); border-radius: var(--r);
-  padding: 12px 16px; margin-top: 12px; gap: 0;
-  box-shadow: var(--shadow-sm);
-}
-.db-field { padding: 4px 20px 4px 0; border-right: 1px solid var(--b1); margin-right: 20px; }
-.db-field:last-child { border-right: none; margin-right: 0; }
-.db-lbl { font-size: 9px; color: var(--t4); text-transform: uppercase; letter-spacing: 1px; font-family: var(--mono); }
-.db-val { font-size: 11px; color: var(--t2); font-family: var(--mono); margin-top: 3px; }
-.st-ok   { color: var(--ok-tx)   !important; font-weight: 600; }
-.st-warn { color: var(--warn-tx) !important; font-weight: 600; }
-.st-crit { color: var(--crit-tx) !important; font-weight: 600; }
-
-/* ── LOG TABLE ──────────────────────────────────── */
-.table-wrap {
-  overflow-x: auto; border-radius: var(--r);
-  border: 1px solid var(--b1);
-  box-shadow: var(--shadow-sm);
-}
-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-thead { position: sticky; top: 0; z-index: 1; }
-th {
-  background: var(--bg-h); color: var(--t4);
-  font-weight: 600; font-size: 9px; letter-spacing: 1px;
-  text-transform: uppercase; padding: 10px 14px;
-  text-align: left; border-bottom: 1px solid var(--b1); white-space: nowrap;
-}
-td { padding: 10px 14px; border-bottom: 1px solid var(--b1); color: var(--t2); vertical-align: middle; }
-tr:last-child td { border-bottom: none; }
-tr:hover td { background: var(--bg-h); }
-.mc  { font-family: var(--mono); font-size: 10px; color: var(--t3); white-space: nowrap; }
-.dn  { color: var(--t1); font-weight: 500; }
-.du  { font-size: 10px; color: var(--t4); }
-.dim { color: var(--t4); }
-
-.lpill { font-size: 9px; padding: 2px 8px; border-radius: 20px; font-weight: 600; letter-spacing: .4px; font-family: var(--mono); }
-.lp-ok   { background: var(--ok-bg);   color: var(--ok-tx);   border: 1px solid var(--ok-br); }
-.lp-warn { background: var(--warn-bg); color: var(--warn-tx); border: 1px solid var(--warn-br); }
-.lp-crit { background: var(--crit-bg); color: var(--crit-tx); border: 1px solid var(--crit-br); }
-
-/* ── ALARM PAGE ─────────────────────────────────── */
-.alarm-kpi { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 20px; }
-.ak-card {
-  background: var(--bg-c); border: 1px solid var(--b1);
-  border-radius: var(--r); padding: 16px; text-align: center;
-  box-shadow: var(--shadow-sm);
-}
-.ak-n  { font-size: 32px; font-weight: 700; line-height: 1; font-family: var(--mono); }
-.ak-l  { font-size: 10px; color: var(--t3); margin-top: 6px; text-transform: uppercase; letter-spacing: .8px; }
-.ak-crit { border-top: 3px solid var(--crit-tx); } .ak-crit .ak-n { color: var(--crit-tx); }
-.ak-warn { border-top: 3px solid var(--warn-tx); } .ak-warn .ak-n { color: var(--warn-tx); }
-
-.alarm-row {
-  border-radius: var(--r); border: 1px solid; padding: 12px 14px;
-  margin-bottom: 8px; display: flex; justify-content: space-between;
-  align-items: center; gap: 12px; background: var(--bg-c);
-  box-shadow: var(--shadow-sm);
-}
-.ar-crit { border-left: 3px solid var(--crit-tx); border-color: var(--crit-br); background: var(--crit-bg); }
-.ar-warn { border-left: 3px solid var(--warn-tx); border-color: var(--warn-br); background: var(--warn-bg); }
-.ar-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.ar-badge { font-size: 9px; font-weight: 700; letter-spacing: .5px; padding: 2px 8px; border-radius: 4px; font-family: var(--mono); }
-.arb-crit { background: var(--crit-bg); color: var(--crit-tx); border: 1px solid var(--crit-br); }
-.arb-warn { background: var(--warn-bg); color: var(--warn-tx); border: 1px solid var(--warn-br); }
-.ar-tags  { display: flex; flex-wrap: wrap; gap: 6px; }
-.ar-tags span { font-size: 11px; color: var(--t2); }
-.ar-ts    { font-size: 10px; color: var(--t3); font-family: var(--mono); white-space: nowrap; flex-shrink: 0; }
-.empty-st { text-align: center; padding: 60px 0; color: var(--ok-tx); }
-.empty-st svg { display: block; margin: 0 auto 10px; }
-.empty-st p { font-size: 13px; color: var(--t3); }
-
-/* ── TEST PAGE ──────────────────────────────────── */
-.test-info {
-  background: var(--accent-s); border: 1px solid var(--accent-b);
-  border-left: 3px solid var(--accent);
-  border-radius: var(--r); padding: 12px 16px;
-  font-size: 12px; color: var(--t2); line-height: 1.7; margin-bottom: 18px;
-}
-.test-info code { font-family: var(--mono); color: var(--accent); font-size: 11px; background: rgba(79,70,229,.08); padding: 1px 4px; border-radius: 3px; }
-
-.preset-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(180px,1fr)); gap: 10px; margin-bottom: 18px; }
-.preset-btn {
-  background: var(--bg-c); border: 1px solid var(--b1); border-radius: var(--r);
-  padding: 14px 16px; cursor: pointer; text-align: left; font-family: var(--font);
-  transition: border-color .12s, box-shadow .12s, transform .12s;
-  box-shadow: var(--shadow-sm);
-}
-.preset-btn:hover { border-color: var(--b2); box-shadow: var(--shadow); transform: translateY(-1px); }
-.pb-l { font-size: 13px; font-weight: 500; margin-bottom: 4px; }
-.pb-d { font-size: 10px; color: var(--t3); font-family: var(--mono); }
-.pb-0 { border-top: 2px solid var(--ok-tx); }   .pb-0 .pb-l { color: var(--ok-tx); }
-.pb-1 { border-top: 2px solid var(--warn-tx); }  .pb-1 .pb-l { color: var(--warn-tx); }
-.pb-2 { border-top: 2px solid var(--crit-tx); }  .pb-2 .pb-l { color: var(--crit-tx); }
-.pb-3 { border-top: 2px solid var(--crit-tx); }  .pb-3 .pb-l { color: var(--crit-tx); }
-
-.input-block {
-  background: var(--bg-c); border: 1px solid var(--b1); border-radius: var(--r);
-  padding: 18px; box-shadow: var(--shadow-sm);
-}
-.ir { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--b1); }
-.ir:last-of-type { margin-bottom: 0; border-bottom: none; }
-.ir-l { font-size: 12px; color: var(--t1); font-weight: 500; }
-.ir-u { font-size: 10px; color: var(--t4); font-weight: 400; }
-.inp {
-  width: 120px; background: var(--bg); border: 1px solid var(--b2);
-  border-radius: var(--r-sm); color: var(--t1); font-size: 13px;
-  padding: 7px 11px; text-align: right; font-family: var(--mono);
-  outline: none; transition: border-color .12s, box-shadow .12s;
-}
-.inp:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,70,229,.12); }
-.send-btn {
-  width: 100%; margin-top: 16px;
-  background: var(--accent); border: none;
-  border-radius: var(--r-sm); color: #fff; font-size: 13px; font-weight: 500;
-  padding: 11px; cursor: pointer; font-family: var(--font);
-  transition: background .12s, transform .1s, box-shadow .12s;
-  box-shadow: 0 2px 8px rgba(79,70,229,.25);
-}
-.send-btn:hover { background: var(--accent-h); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(79,70,229,.3); }
-.send-btn:active { transform: translateY(0); }
-
-/* ── TOAST ──────────────────────────────────────── */
-.toast {
-  position: fixed; bottom: 20px; right: 20px; z-index: 9999;
-  padding: 10px 16px; border-radius: var(--r); border: 1px solid;
-  font-size: 11px; font-family: var(--mono); letter-spacing: .3px;
-  opacity: 0; transform: translateY(10px);
-  transition: opacity .2s, transform .2s; pointer-events: none;
-  box-shadow: var(--shadow-lg);
-}
-.t-ok  { background: var(--ok-bg);   border-color: var(--ok-br);   color: var(--ok-tx); }
-.t-err { background: var(--crit-bg); border-color: var(--crit-br); color: var(--crit-tx); }
-
-/* ── RESPONSIVE ─────────────────────────────────── */
-@media(max-width:640px) {
-  .side        { display: none; }
-  .main        { padding: 14px 16px; }
-  .kpi-row     { grid-template-columns: repeat(2,1fr); }
-  .alarm-kpi   { grid-template-columns: repeat(3,1fr); }
-  .node-row    { grid-template-columns: 1fr; }
-}
+@media(max-width:640px){.side{display:none}.main{padding:14px 16px}.kpi-row{grid-template-columns:repeat(2,1fr)}.alarm-kpi{grid-template-columns:repeat(3,1fr)}.node-row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -992,23 +743,18 @@ tr:hover td { background: var(--bg-h); }
 
 <div class="shell">
 
-<!-- ── SIDEBAR ──────────────────────────────────── -->
+<!-- SIDEBAR -->
 <nav class="side" id="sidebar">
-
   <div class="side-brand">
     <div class="brand-sq">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round">
-        <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
-      </svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
     </div>
     <div class="brand-text">
       <div class="brand-name">SmartFactory</div>
       <div class="brand-id">Telemetry Platform</div>
     </div>
     <button class="side-toggle" onclick="toggleSidebar()" title="Toggle sidebar">
-      <svg class="toggle-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-        <path d="M15 18l-6-6 6-6"/>
-      </svg>
+      <svg class="toggle-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>
     </button>
   </div>
 
@@ -1055,15 +801,13 @@ tr:hover td { background: var(--bg-h); }
     <div class="sf-val">factory_data</div>
     <div class="sf-val" style="color:var(--t4);margin-top:2px">asia-southeast1</div>
   </div>
-
 </nav>
 
-<!-- ── MAIN ─────────────────────────────────────── -->
+<!-- MAIN -->
 <main class="main">
 
-  <!-- ═══ DASHBOARD ══════════════════════════════ -->
+  <!-- DASHBOARD -->
   <div class="pg on" id="pg-dashboard">
-
     <div class="ph">
       <div>
         <div class="ph-title">Dashboard</div>
@@ -1089,30 +833,21 @@ tr:hover td { background: var(--bg-h); }
     <div class="kpi-row">
       <div class="kpi-card kc-ok" id="c-getaran">
         <div class="kpi-top">
-          <span class="kpi-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h2M5 6l1.5 2M5 18l1.5-2M12 2v2M12 20v2M19 6l-1.5 2M19 18l-1.5-2M22 12h-2"/><circle cx="12" cy="12" r="4"/></svg>
-            Getaran
-          </span>
+          <span class="kpi-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h2M5 6l1.5 2M5 18l1.5-2M12 2v2M12 20v2M19 6l-1.5 2M19 18l-1.5-2M22 12h-2"/><circle cx="12" cy="12" r="4"/></svg>Getaran</span>
           <span class="cb st-badge-ok">NORMAL</span>
         </div>
         <div><span class="cv">—</span><span class="cu">mm/s</span></div>
       </div>
       <div class="kpi-card kc-ok" id="c-arus">
         <div class="kpi-top">
-          <span class="kpi-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-            Arus Listrik
-          </span>
+          <span class="kpi-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Arus Listrik</span>
           <span class="cb st-badge-ok">NORMAL</span>
         </div>
         <div><span class="cv">—</span><span class="cu">A</span></div>
       </div>
       <div class="kpi-card kc-ok" id="c-suhu-n1">
         <div class="kpi-top">
-          <span class="kpi-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
-            Suhu Mesin
-          </span>
+          <span class="kpi-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>Suhu Mesin</span>
           <span class="cb st-badge-ok">NORMAL</span>
         </div>
         <div><span class="cv">—</span><span class="cu">°C</span></div>
@@ -1128,30 +863,21 @@ tr:hover td { background: var(--bg-h); }
     <div class="kpi-row">
       <div class="kpi-card kc-ok" id="c-suhu">
         <div class="kpi-top">
-          <span class="kpi-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
-            Suhu Ruang
-          </span>
+          <span class="kpi-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>Suhu Ruang</span>
           <span class="cb st-badge-ok">NORMAL</span>
         </div>
         <div><span class="cv">—</span><span class="cu">°C</span></div>
       </div>
       <div class="kpi-card kc-ok" id="c-gas">
         <div class="kpi-top">
-          <span class="kpi-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2c0 4-4 5-4 10a8 8 0 0 0 16 0c0-5-4-6-4-10"/><path d="M12 22v-4"/></svg>
-            Gas / Asap
-          </span>
+          <span class="kpi-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2c0 4-4 5-4 10a8 8 0 0 0 16 0c0-5-4-6-4-10"/><path d="M12 22v-4"/></svg>Gas / Asap</span>
           <span class="cb st-badge-ok">NORMAL</span>
         </div>
         <div><span class="cv">—</span><span class="cu">ppm</span></div>
       </div>
       <div class="kpi-card kc-ok" id="c-hum">
         <div class="kpi-top">
-          <span class="kpi-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
-            Kelembaban
-          </span>
+          <span class="kpi-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>Kelembaban</span>
           <span class="cb st-badge-ok">NORMAL</span>
         </div>
         <div><span class="cv">—</span><span class="cu">%</span></div>
@@ -1159,140 +885,75 @@ tr:hover td { background: var(--bg-h); }
     </div>
 
     <!-- CHARTS -->
-    <div class="sh">
-      <span class="sh-label">Trend Charts — Per Parameter</span>
-      <div class="sh-line"></div>
-    </div>
-
+    <div class="sh"><span class="sh-label">Trend Charts — Per Parameter</span><div class="sh-line"></div></div>
     <div class="chart-grid">
-
-      <!-- Getaran — area, indigo -->
       <div class="chart-box ch-getaran">
         <div class="cb-head">
-          <div class="cb-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2"><path d="M2 12h2M5 6l1.5 2M5 18l1.5-2M12 2v2M12 20v2M19 6l-1.5 2M19 18l-1.5-2M22 12h-2"/><circle cx="12" cy="12" r="4"/></svg>
-          </div>
-          <div class="cb-info">
-            <div class="cb-title">Getaran</div>
-            <div class="cb-sub">Node 1 · mm/s</div>
-          </div>
+          <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2"><path d="M2 12h2M5 6l1.5 2M5 18l1.5-2M12 2v2M12 20v2M19 6l-1.5 2M19 18l-1.5-2M22 12h-2"/><circle cx="12" cy="12" r="4"/></svg></div>
+          <div class="cb-info"><div class="cb-title">Getaran</div><div class="cb-sub">Node 1 · mm/s</div></div>
           <span class="cb-type">Area</span>
         </div>
         <div class="cw"><canvas id="chart-getaran"></canvas></div>
       </div>
-
-      <!-- Arus — bar, cyan -->
       <div class="chart-box ch-arus">
         <div class="cb-head">
-          <div class="cb-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#0891b2" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-          </div>
-          <div class="cb-info">
-            <div class="cb-title">Arus Listrik</div>
-            <div class="cb-sub">Node 1 · Ampere</div>
-          </div>
+          <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#0891b2" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+          <div class="cb-info"><div class="cb-title">Arus Listrik</div><div class="cb-sub">Node 1 · Ampere</div></div>
           <span class="cb-type">Bar</span>
         </div>
         <div class="cw"><canvas id="chart-arus"></canvas></div>
       </div>
-
-      <!-- Suhu N1 — stepped, emerald -->
       <div class="chart-box ch-suhu-n1">
         <div class="cb-head">
-          <div class="cb-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
-          </div>
-          <div class="cb-info">
-            <div class="cb-title">Suhu Mesin</div>
-            <div class="cb-sub">Node 1 · °C</div>
-          </div>
+          <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
+          <div class="cb-info"><div class="cb-title">Suhu Mesin</div><div class="cb-sub">Node 1 · °C</div></div>
           <span class="cb-type">Step</span>
         </div>
         <div class="cw"><canvas id="chart-suhu-n1"></canvas></div>
       </div>
-
-      <!-- Suhu N2 — gradient area, amber -->
       <div class="chart-box ch-suhu-n2">
         <div class="cb-head">
-          <div class="cb-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
-          </div>
-          <div class="cb-info">
-            <div class="cb-title">Suhu Ruang</div>
-            <div class="cb-sub">Node 2 · °C</div>
-          </div>
+          <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
+          <div class="cb-info"><div class="cb-title">Suhu Ruang</div><div class="cb-sub">Node 2 · °C</div></div>
           <span class="cb-type">Gradient</span>
         </div>
         <div class="cw"><canvas id="chart-suhu-n2"></canvas></div>
       </div>
-
-      <!-- Gas — bar + conditional color, red -->
       <div class="chart-box ch-gas">
         <div class="cb-head">
-          <div class="cb-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><path d="M8 2c0 4-4 5-4 10a8 8 0 0 0 16 0c0-5-4-6-4-10"/><path d="M12 22v-4"/></svg>
-          </div>
-          <div class="cb-info">
-            <div class="cb-title">Gas / Asap</div>
-            <div class="cb-sub">Node 2 · ppm</div>
-          </div>
+          <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><path d="M8 2c0 4-4 5-4 10a8 8 0 0 0 16 0c0-5-4-6-4-10"/><path d="M12 22v-4"/></svg></div>
+          <div class="cb-info"><div class="cb-title">Gas / Asap</div><div class="cb-sub">Node 2 · ppm</div></div>
           <span class="cb-type">Threshold</span>
         </div>
         <div class="cw"><canvas id="chart-gas"></canvas></div>
         <div class="cf">Bar merah = Anomali &nbsp;·&nbsp; Kuning = Warning</div>
       </div>
-
-      <!-- Kelembaban — dashed line, violet -->
       <div class="chart-box ch-hum">
         <div class="cb-head">
-          <div class="cb-icon">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
-          </div>
-          <div class="cb-info">
-            <div class="cb-title">Kelembaban</div>
-            <div class="cb-sub">Node 2 · %</div>
-          </div>
+          <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg></div>
+          <div class="cb-info"><div class="cb-title">Kelembaban</div><div class="cb-sub">Node 2 · %</div></div>
           <span class="cb-type">Dashed</span>
         </div>
         <div class="cw"><canvas id="chart-hum"></canvas></div>
       </div>
-
     </div>
 
     <!-- NODE OVERVIEW -->
-    <div class="sh">
-      <span class="sh-label">Node Overview</span>
-      <div class="sh-line"></div>
-    </div>
+    <div class="sh"><span class="sh-label">Node Overview</span><div class="sh-line"></div></div>
     <div class="node-row">
       <div class="node-c">
-        <div class="nc-ico ni-1">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#4F46E5" stroke="none"/></svg>
-        </div>
-        <div class="nc-body">
-          <div class="nc-name">ESP32 Node 1</div>
-          <div class="nc-desc">Machine · MQTT → factoryesp1in</div>
-        </div>
-        <div class="nc-st"><span class="sdot sd-ok" style="width:6px;height:6px"></span>Online</div>
+        <div class="nc-ico ni-1"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#4F46E5" stroke="none"/></svg></div>
+        <div class="nc-body"><div class="nc-name">ESP32 Node 1</div><div class="nc-desc">Machine · MQTT → factoryesp1in</div></div>
+        <div class="nc-st"><span class="sdot sd-ok sdot-dot-n1" style="width:6px;height:6px"></span>Online</div>
       </div>
       <div class="node-c">
-        <div class="nc-ico ni-2">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#D97706" stroke="none"/></svg>
-        </div>
-        <div class="nc-body">
-          <div class="nc-name">ESP32 Node 2</div>
-          <div class="nc-desc">Environment · MQTT → factoryesp2in</div>
-        </div>
-        <div class="nc-st"><span class="sdot sd-ok" style="width:6px;height:6px"></span>Online</div>
+        <div class="nc-ico ni-2"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#D97706" stroke="none"/></svg></div>
+        <div class="nc-body"><div class="nc-name">ESP32 Node 2</div><div class="nc-desc">Environment · MQTT → factoryesp2in</div></div>
+        <div class="nc-st"><span class="sdot sd-ok sdot-dot-n2" style="width:6px;height:6px"></span>Online</div>
       </div>
       <div class="node-c">
-        <div class="nc-ico ni-3">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
-        </div>
-        <div class="nc-body">
-          <div class="nc-name">ESP32 Node 3</div>
-          <div class="nc-desc">Gateway → Realtime Database</div>
-        </div>
+        <div class="nc-ico ni-3"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
+        <div class="nc-body"><div class="nc-name">ESP32 Node 3</div><div class="nc-desc">Gateway → Realtime Database</div></div>
         <div class="nc-st"><span class="sdot sd-ok" style="width:6px;height:6px"></span>Online</div>
       </div>
     </div>
@@ -1301,13 +962,14 @@ tr:hover td { background: var(--bg-h); }
     <div class="db-strip">
       <div class="db-field"><div class="db-lbl">Node Path</div><div class="db-val">factory_data</div></div>
       <div class="db-field"><div class="db-lbl">Record ID</div><div class="db-val" id="db-id">—</div></div>
+      <div class="db-field"><div class="db-lbl">Data Node 1</div><div class="db-val" id="db-n1">—</div></div>
+      <div class="db-field"><div class="db-lbl">Data Node 2</div><div class="db-val" id="db-n2">—</div></div>
       <div class="db-field"><div class="db-lbl">Status</div><div class="db-val st-ok" id="db-status">—</div></div>
       <div class="db-field"><div class="db-lbl">Waktu Tercatat</div><div class="db-val" id="db-ts">—</div></div>
     </div>
-
   </div><!-- /dashboard -->
 
-  <!-- ═══ LOG ════════════════════════════════════ -->
+  <!-- LOG -->
   <div class="pg" id="pg-log">
     <div class="ph">
       <div><div class="ph-title">Log Data</div><div class="ph-sub">Riwayat 30 data terbaru</div></div>
@@ -1327,7 +989,7 @@ tr:hover td { background: var(--bg-h); }
     </div>
   </div>
 
-  <!-- ═══ ALARM ══════════════════════════════════ -->
+  <!-- ALARM -->
   <div class="pg" id="pg-alarm">
     <div class="ph"><div><div class="ph-title">Alarm Center</div><div class="ph-sub">Riwayat kejadian warning &amp; anomali</div></div></div>
     <div class="alarm-kpi">
@@ -1339,10 +1001,14 @@ tr:hover td { background: var(--bg-h); }
     <div id="alarm-list"><div style="text-align:center;color:var(--t4);padding:48px">Memuat...</div></div>
   </div>
 
-  <!-- ═══ TEST ════════════════════════════════════ -->
+  <!-- TEST INSERT -->
   <div class="pg" id="pg-test">
     <div class="ph"><div><div class="ph-title">Test Insert</div><div class="ph-sub">Simulasi injeksi data ke Realtime Database</div></div></div>
-    <div class="test-info">Tombol ini menulis data dummy ke path <code>factory_data/{tanggal}/{jam}</code> untuk memverifikasi reaksi realtime dashboard.</div>
+    <div class="test-info">
+      Tombol ini menulis data dummy ke path <code>factory_data/{tanggal}/{jam_menit_detik_ms}</code>.<br>
+      Format key sama persis dengan Node 3, sehingga tidak akan bentrok dengan data hardware.<br>
+      Anomali dan kebocoran ditentukan <b>otomatis</b> dari threshold (Getaran ≥3.0, Arus ≥5.0, Suhu ≥42°C, Gas ≥300 ppm).
+    </div>
     <div class="sh"><span class="sh-label">Preset Cepat</span><div class="sh-line"></div></div>
     <div class="preset-grid">
       <button class="preset-btn pb-0" onclick="sendPreset(0)"><div class="pb-l">Normal</div><div class="pb-d">Gas 180ppm · Suhu 35°C</div></button>
@@ -1352,17 +1018,22 @@ tr:hover td { background: var(--bg-h); }
     </div>
     <div class="sh"><span class="sh-label">Input Manual</span><div class="sh-line"></div></div>
     <div class="input-block">
-      <div class="ir"><span class="ir-l">Getaran <span class="ir-u">(mm/s)</span></span><input class="inp" id="i-getaran" type="number" value="2.0" step="0.1"/></div>
-      <div class="ir"><span class="ir-l">Arus <span class="ir-u">(A)</span></span><input class="inp" id="i-arus" type="number" value="3.5" step="0.1"/></div>
-      <div class="ir"><span class="ir-l">Suhu <span class="ir-u">(°C)</span></span><input class="inp" id="i-suhu" type="number" value="37"/></div>
-      <div class="ir"><span class="ir-l">Kelembaban <span class="ir-u">(%)</span></span><input class="inp" id="i-hum" type="number" value="70"/></div>
-      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(ppm)</span></span><input class="inp" id="i-gas" type="number" value="200"/></div>
+      <!-- Node 1 group -->
+      <div class="input-section-label">Node 1 — Machine</div>
+      <div class="ir"><span class="ir-l">Getaran <span class="ir-u">(mm/s)</span></span><input class="inp" id="i-getaran" type="number" value="2.0" step="0.1" min="0"/></div>
+      <div class="ir"><span class="ir-l">Arus <span class="ir-u">(A)</span></span><input class="inp" id="i-arus" type="number" value="3.5" step="0.1" min="0"/></div>
+      <div class="ir"><span class="ir-l">Suhu Mesin <span class="ir-u">(°C)</span></span><input class="inp" id="i-suhu-m" type="number" value="37" min="0"/></div>
+      <!-- Node 2 group -->
+      <div class="input-section-label">Node 2 — Environment</div>
+      <div class="ir"><span class="ir-l">Suhu Ruang <span class="ir-u">(°C)</span></span><input class="inp" id="i-suhu-e" type="number" value="29" min="0"/></div>
+      <div class="ir"><span class="ir-l">Kelembaban <span class="ir-u">(%)</span></span><input class="inp" id="i-hum" type="number" value="70" min="0" max="100"/></div>
+      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(ppm)</span></span><input class="inp" id="i-gas" type="number" value="200" min="0"/></div>
       <button class="send-btn" onclick="sendCustom()">Kirim ke Database</button>
     </div>
   </div>
 
 </main>
-</div><!-- /shell -->
+</div>
 
 <div id="toast" class="toast t-ok"></div>
 
@@ -1373,7 +1044,6 @@ function nav(p) {
   document.getElementById('pg-' + p).classList.add('on');
   document.querySelector(`[onclick="nav('${p}')"]`).classList.add('on');
 }
-
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('collapsed');
 }

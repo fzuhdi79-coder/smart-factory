@@ -141,8 +141,10 @@ function renderDash(d) {
   setCard('c-arus',    d.arus,    'A',    getSt('arus',    d.arus));
   setCard('c-suhu-n1', d.suhu_n1, '°C',  getSt('suhu',    d.suhu_n1));
   setCard('c-suhu',    d.suhu_n2, '°C',  getSt('suhu',    d.suhu_n2));
-  setCard('c-gas',     d.gas,     'ppm', getSt('gas',     d.gas));
-  setCard('c-hum',     d.hum,     '%',   'ok');
+  
+  // PERBAIKAN: Jika d.leak_env bernilai true, otomatis set status card ke 'crit' (ANOMALI)
+  setCard('c-gas',     d.gas,     'ppm', d.leak_env ? 'crit' : getSt('gas', d.gas));
+  setCard('c-hum',     d.hum,     '%',   d.leak_env ? 'crit' : 'ok');
 
   // Tanda "N/A" jika node tidak mengirim data di record ini
   if (!d.hasN1) {

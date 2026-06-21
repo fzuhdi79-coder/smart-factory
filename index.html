@@ -26,14 +26,32 @@ const app = initializeApp(firebaseConfig);
 const db  = getDatabase(app);
 
 // ── Threshold sesuai hardware ──────────────────────────────────
-// Node 1 Machine
-// Node 2 Environment: suhu >78°C anomali, arus >42.7A anomali, getaran >7.3mm/s anomali
+// Diturunkan dari define ADC firmware (12-bit, 0–4095) yang dikonversi
+// memakai rumus map() yang sama persis dengan yang dipakai node untuk
+// menghitung nilai fisiknya, lalu warn diset ±90% dari nilai danger
+// (mengikuti rasio yang sudah dipakai arus/suhu mesin Node 1).
+//
+// Node 1 — Machine (raw ADC dikonversi langsung oleh komentar firmware):
+//   THRESHOLD_GETARAN 3000 → ≈7.3 mm/s   | THRESHOLD_ARUS 3500 → ≈42.7 A
+//   THRESHOLD_SUHU    3200 → ≈78 °C
+//
+// Node 2 — Environment (map(adc,0,4095,0,8000 atau 0,10000)/100):
+//   THRESHOLD_SUHU  3686 → map(...,0,8000)/100  = 72.01 °C   (BUKAN 78°C)
+//   THRESHOLD_HUMID 3482 → map(...,0,10000)/100 = 85.03 %    (sebelumnya tidak dipakai)
+//   THRESHOLD_GAS   2785 → map(...,0,10000)/100 = 68.01      (skala 0–100, BUKAN 250–300!)
+//
+// PENTING: firmware Node 2 membatasi nilai gas ke rentang 0–100 (map ke
+// 0–10000 lalu dibagi 100). Threshold lama 250/300 tidak pernah bisa
+// tercapai oleh data asli dari hardware — deteksi warn/anomali gas di
+// dashboard sebelumnya efektif mati/tidak pernah aktif. Sudah dikoreksi
+// ke skala yang sama dengan output node.
 const THR = {
-  suhu_mesin:  { warn: 70.0,  danger: 78.0  },  // Node 1
-  suhu_ruang:  { warn: 70.0,  danger: 78.0  },  // Node 2 (sama threshold)
-  arus:        { warn: 38.0,  danger: 42.7  },  // Node 1
-  getaran:     { warn: 6.0,   danger: 7.3   },  // Node 1
-  gas:         { warn: 250,   danger: 300   },  // Node 2
+  suhu_mesin:  { warn: 70.2,  danger: 78.0  },  // Node 1
+  suhu_ruang:  { warn: 64.8,  danger: 72.0  },  // Node 2 — dikoreksi dari ADC 3686
+  arus:        { warn: 38.4,  danger: 42.7  },  // Node 1
+  getaran:     { warn: 6.6,   danger: 7.3   },  // Node 1
+  gas:         { warn: 61.2,  danger: 68.0  },  // Node 2 — dikoreksi dari ADC 2785 (skala 0–100)
+  humid:       { warn: 76.5,  danger: 85.0  },  // Node 2 — baru, dari ADC 3482 (sebelumnya tanpa status)
 };
 
 function getSt(key, val) {
@@ -91,7 +109,8 @@ onValue(ref(db, 'factory_data'), snap => {
 
         const envAnom = d.leak_env
           || getSt('gas',       d.gas)     === 'crit'
-          || getSt('suhu_ruang',d.suhu_n2) === 'crit';
+          || getSt('suhu_ruang',d.suhu_n2) === 'crit'
+          || getSt('humid',     d.hum)     === 'crit';
 
         let st = 'ok';
         if (machAnom || envAnom) {
@@ -101,7 +120,8 @@ onValue(ref(db, 'factory_data'), snap => {
           getSt('arus',       d.arus)    === 'warn' ||
           getSt('suhu_mesin', d.suhu_n1) === 'warn' ||
           getSt('suhu_ruang', d.suhu_n2) === 'warn' ||
-          getSt('gas',        d.gas)     === 'warn'
+          getSt('gas',        d.gas)     === 'warn' ||
+          getSt('humid',      d.hum)     === 'warn'
         ) {
           st = 'warn';
         }
@@ -197,7 +217,7 @@ function renderDash(d) {
   if (d.hasN2) {
     setCard('c-suhu', d.suhu_n2, '°C',  getSt('suhu_ruang', d.suhu_n2));
     setCard('c-gas',  d.gas,     'ppm', getSt('gas',        d.gas));
-    setCard('c-hum',  d.hum,     '%',   'ok');
+    setCard('c-hum',  d.hum,     '%',   getSt('humid',      d.hum));
   } else {
     setCardNA('c-suhu');
     setCardNA('c-gas');
@@ -213,6 +233,8 @@ function renderDash(d) {
     if (d.anom_mach || getSt('getaran', d.getaran) === 'crit' ||
         getSt('arus', d.arus) === 'crit' || getSt('suhu_mesin', d.suhu_n1) === 'crit')
       msgs.push('Anomali mesin terdeteksi — Node 1');
+    if (getSt('humid', d.hum) === 'crit')
+      msgs.push('Kelembaban di luar batas aman — Node 2');
     if (!msgs.length) msgs.push('Parameter sensor mendekati batas bahaya');
     document.getElementById('banner-text').textContent = msgs.join('  ·  ');
     banner.className = `banner bn-${d.status}`;
@@ -369,8 +391,8 @@ function updateCharts(docs) {
   const cGas = charts.gas;
   if (cGas) {
     const gasVals  = docs.map(d => d.gas ?? null);
-    const bgColors = gasVals.map(v => v === null ? '#94a3b820' : v >= 300 ? '#dc262655' : v >= 250 ? '#f59e0b44' : '#dc262620');
-    const bdColors = gasVals.map(v => v === null ? '#94a3b8'   : v >= 300 ? '#dc2626'   : v >= 250 ? '#f59e0b'   : '#dc2626aa');
+    const bgColors = gasVals.map(v => v === null ? '#94a3b820' : v >= THR.gas.danger ? '#dc262655' : v >= THR.gas.warn ? '#f59e0b44' : '#dc262620');
+    const bdColors = gasVals.map(v => v === null ? '#94a3b8'   : v >= THR.gas.danger ? '#dc2626'   : v >= THR.gas.warn ? '#f59e0b'   : '#dc2626aa');
     cGas.data.labels = labels;
     cGas.data.datasets[0].data            = gasVals;
     cGas.data.datasets[0].backgroundColor = bgColors;
@@ -393,7 +415,7 @@ function renderLog(docs) {
       <td>${d.hasN1 && d.suhu_n1 !== null ? fv(d.suhu_n1,'°C',  getSt('suhu_mesin',d.suhu_n1)) : na()}</td>
       <td>${d.hasN2 && d.suhu_n2 !== null ? fv(d.suhu_n2,'°C',  getSt('suhu_ruang',d.suhu_n2)) : na()}</td>
       <td>${d.hasN2 && d.gas     !== null ? fv(d.gas,    'ppm', getSt('gas',d.gas))              : na()}</td>
-      <td>${d.hasN2 && d.hum     !== null ? fv(d.hum,    '%',   'ok')                            : na()}</td>
+      <td>${d.hasN2 && d.hum     !== null ? fv(d.hum,    '%',   getSt('humid',d.hum))            : na()}</td>
       <td><span class="lpill lp-${d.status}">${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'}</span></td>
     </tr>`;
   }).join('');
@@ -433,6 +455,8 @@ function renderAlarms(docs) {
       tg.push(`Suhu Mesin ${d.suhu_n1 !== null ? parseFloat(d.suhu_n1).toFixed(1) + '°C' : ''}`.trim());
     if (getSt('suhu_ruang', d.suhu_n2) === 'crit')
       tg.push(`Suhu Ruang ${d.suhu_n2 !== null ? parseFloat(d.suhu_n2).toFixed(1) + '°C' : ''}`.trim());
+    if (getSt('humid', d.hum) === 'crit')
+      tg.push(`Kelembaban ${d.hum !== null ? parseFloat(d.hum).toFixed(1) + '%' : ''}`.trim());
     // Warning tags
     if (!tg.length) {
       if (getSt('gas',        d.gas)     === 'warn') tg.push(`Gas ${parseFloat(d.gas).toFixed(0)} ppm`);
@@ -440,6 +464,7 @@ function renderAlarms(docs) {
       if (getSt('arus',       d.arus)    === 'warn') tg.push(`Arus ${parseFloat(d.arus).toFixed(2)} A`);
       if (getSt('suhu_mesin', d.suhu_n1) === 'warn') tg.push(`Suhu Mesin ${parseFloat(d.suhu_n1).toFixed(1)}°C`);
       if (getSt('suhu_ruang', d.suhu_n2) === 'warn') tg.push(`Suhu Ruang ${parseFloat(d.suhu_n2).toFixed(1)}°C`);
+      if (getSt('humid',      d.hum)     === 'warn') tg.push(`Kelembaban ${parseFloat(d.hum).toFixed(1)}%`);
     }
     return `<div class="alarm-row ar-${d.status}">
       <div class="ar-left">
@@ -463,10 +488,10 @@ function sbState(st, msg) {
 
 // ── Test Insert ────────────────────────────────────────────────
 const PRESETS = [
-  { label: 'Normal',       data: { getaran: 4.0,  arus: 25.0, suhu_m: 55, suhu_e: 50, hum: 72, gas: 180, am: false, ke: false } },
-  { label: 'Warning',      data: { getaran: 6.2,  arus: 39.0, suhu_m: 71, suhu_e: 71, hum: 65, gas: 260, am: false, ke: false } },
-  { label: 'Anomali Gas',  data: { getaran: 5.0,  arus: 30.0, suhu_m: 60, suhu_e: 55, hum: 68, gas: 318, am: false, ke: true  } },
-  { label: 'Full Anomali', data: { getaran: 7.5,  arus: 43.5, suhu_m: 80, suhu_e: 79, hum: 90, gas: 420, am: true,  ke: true  } },
+  { label: 'Normal',       data: { getaran: 4.0,  arus: 25.0, suhu_m: 55, suhu_e: 50, hum: 72, gas: 30, am: false, ke: false } },
+  { label: 'Warning',      data: { getaran: 6.2,  arus: 39.0, suhu_m: 71, suhu_e: 71, hum: 65, gas: 64, am: false, ke: false } },
+  { label: 'Anomali Gas',  data: { getaran: 5.0,  arus: 30.0, suhu_m: 60, suhu_e: 55, hum: 68, gas: 75, am: false, ke: true  } },
+  { label: 'Full Anomali', data: { getaran: 7.5,  arus: 43.5, suhu_m: 80, suhu_e: 79, hum: 90, gas: 92, am: true,  ke: true  } },
 ];
 
 function pathNow() {
@@ -494,8 +519,8 @@ window.sendCustom = async () => {
   const t = pathNow();
   const gas = g('i-gas'), suhu_m = g('i-suhu-m'), suhu_e = g('i-suhu-e');
   const getaran = g('i-getaran'), arus = g('i-arus'), hum = g('i-hum');
-  const am = getaran >= 7.3 || arus >= 42.7 || suhu_m >= 78;
-  const ke = gas >= 300;
+  const am = getaran >= THR.getaran.danger || arus >= THR.arus.danger || suhu_m >= THR.suhu_mesin.danger;
+  const ke = gas >= THR.gas.danger;
   try {
     await set(ref(db, `factory_data/${t.tgl}/${t.key}`), {
       waktu_lengkap:    t.full,
@@ -981,7 +1006,7 @@ tr.row-warn:hover td{background:#fde68a55}
       <div class="chart-box ch-suhu-n2">
         <div class="cb-head">
           <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
-          <div class="cb-info"><div class="cb-title">Suhu Ruang</div><div class="cb-sub">Node 2 · °C · anomali ≥78</div></div>
+          <div class="cb-info"><div class="cb-title">Suhu Ruang</div><div class="cb-sub">Node 2 · °C · anomali ≥72</div></div>
           <span class="cb-type">Gradient</span>
         </div>
         <div class="cw"><canvas id="chart-suhu-n2"></canvas></div>
@@ -993,7 +1018,7 @@ tr.row-warn:hover td{background:#fde68a55}
           <span class="cb-type">Threshold</span>
         </div>
         <div class="cw"><canvas id="chart-gas"></canvas></div>
-        <div class="cf">Merah ≥300 ppm · Kuning ≥250 ppm</div>
+        <div class="cf">Merah ≥68 · Kuning ≥61 (skala 0–100 sesuai mapping firmware)</div>
       </div>
       <div class="chart-box ch-hum">
         <div class="cb-head">
@@ -1080,14 +1105,15 @@ tr.row-warn:hover td{background:#fde68a55}
     <div class="ph"><div><div class="ph-title">Test Insert</div><div class="ph-sub">Simulasi injeksi data ke Realtime Database</div></div></div>
     <div class="test-info">
       Menulis ke path <code>factory_data/{tanggal}/{jam_menit_detik_ms}</code> — format sama dengan Node 3.<br>
-      Threshold anomali: Getaran ≥<b>7.3 mm/s</b>, Arus ≥<b>42.7 A</b>, Suhu ≥<b>78°C</b>, Gas ≥<b>300 ppm</b>.
+      Threshold anomali Node 1: Getaran ≥<b>7.3 mm/s</b>, Arus ≥<b>42.7 A</b>, Suhu Mesin ≥<b>78°C</b>.<br>
+      Threshold anomali Node 2: Suhu Ruang ≥<b>72°C</b>, Kelembaban ≥<b>85%</b>, Gas ≥<b>68</b> (skala 0–100).
     </div>
     <div class="sh"><span class="sh-label">Preset Cepat</span><div class="sh-line"></div></div>
     <div class="preset-grid">
-      <button class="preset-btn pb-0" onclick="sendPreset(0)"><div class="pb-l">Normal</div><div class="pb-d">Gas 180ppm · Getaran 4.0mm/s</div></button>
-      <button class="preset-btn pb-1" onclick="sendPreset(1)"><div class="pb-l">Warning</div><div class="pb-d">Gas 260ppm · Arus 39A · Suhu 71°C</div></button>
-      <button class="preset-btn pb-2" onclick="sendPreset(2)"><div class="pb-l">Anomali Gas</div><div class="pb-d">Gas 318ppm · Kebocoran aktif</div></button>
-      <button class="preset-btn pb-3" onclick="sendPreset(3)"><div class="pb-l">Full Anomali</div><div class="pb-d">Gas 420ppm · Arus 43.5A · Suhu 80°C</div></button>
+      <button class="preset-btn pb-0" onclick="sendPreset(0)"><div class="pb-l">Normal</div><div class="pb-d">Gas 30 · Getaran 4.0mm/s</div></button>
+      <button class="preset-btn pb-1" onclick="sendPreset(1)"><div class="pb-l">Warning</div><div class="pb-d">Gas 64 · Arus 39A · Suhu 71°C</div></button>
+      <button class="preset-btn pb-2" onclick="sendPreset(2)"><div class="pb-l">Anomali Gas</div><div class="pb-d">Gas 75 · Kebocoran aktif</div></button>
+      <button class="preset-btn pb-3" onclick="sendPreset(3)"><div class="pb-l">Full Anomali</div><div class="pb-d">Gas 92 · Arus 43.5A · Suhu 80°C</div></button>
     </div>
     <div class="sh"><span class="sh-label">Input Manual</span><div class="sh-line"></div></div>
     <div class="input-block">
@@ -1096,9 +1122,9 @@ tr.row-warn:hover td{background:#fde68a55}
       <div class="ir"><span class="ir-l">Arus <span class="ir-u">(A · anomali ≥42.7)</span></span><input class="inp" id="i-arus" type="number" value="25.0" step="0.1" min="0"/></div>
       <div class="ir"><span class="ir-l">Suhu Mesin <span class="ir-u">(°C · anomali ≥78)</span></span><input class="inp" id="i-suhu-m" type="number" value="55" min="0"/></div>
       <div class="input-section-label">Node 2 — Environment</div>
-      <div class="ir"><span class="ir-l">Suhu Ruang <span class="ir-u">(°C · anomali ≥78)</span></span><input class="inp" id="i-suhu-e" type="number" value="50" min="0"/></div>
-      <div class="ir"><span class="ir-l">Kelembaban <span class="ir-u">(%)</span></span><input class="inp" id="i-hum" type="number" value="70" min="0" max="100"/></div>
-      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(ppm · anomali ≥300)</span></span><input class="inp" id="i-gas" type="number" value="200" min="0"/></div>
+      <div class="ir"><span class="ir-l">Suhu Ruang <span class="ir-u">(°C · anomali ≥72)</span></span><input class="inp" id="i-suhu-e" type="number" value="50" min="0"/></div>
+      <div class="ir"><span class="ir-l">Kelembaban <span class="ir-u">(% · anomali ≥85)</span></span><input class="inp" id="i-hum" type="number" value="70" min="0" max="100"/></div>
+      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(skala 0–100 · anomali ≥68)</span></span><input class="inp" id="i-gas" type="number" value="20" min="0" max="100"/></div>
       <button class="send-btn" onclick="sendCustom()">Kirim ke Database</button>
     </div>
   </div>

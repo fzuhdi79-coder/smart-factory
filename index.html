@@ -226,15 +226,7 @@ function setCard(id, val, unit, st) {
   if (badge) { badge.textContent = stLabels[st] || 'NORMAL'; badge.className = `cb st-badge-${st}`; }
   el.className = `kpi-card kc-${st}`;
 }
-
-function dot(id, st) {
-  const el = document.getElementById(id);
-  if (el) el.className = `sdot sd-${st}`;
-  // Update node-overview dot juga
-  const els = document.querySelectorAll(`.sdot-${id}`);
-  els.forEach(e => e.className = `sdot sd-${st} sdot-${id}`);
-}
-
+  
 // ── Chart Factories ────────────────────────────────────────────
 function baseOpts(yLabel, color, extra = {}) {
   return {

@@ -25,27 +25,32 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getDatabase(app);
 
-// ── Threshold ──────────────────────────────────────────────────
+// ── Threshold sesuai hardware ──────────────────────────────────
+// Node 1 Machine
+// Node 2 Environment: suhu >78°C anomali, arus >42.7A anomali, getaran >7.3mm/s anomali
 const THR = {
-  suhu:    { warn: 38,  danger: 42  },
-  gas:     { warn: 250, danger: 300 },
-  getaran: { warn: 2.0, danger: 3.0 },
-  arus:    { warn: 4.0, danger: 5.0 },
+  suhu_mesin:  { warn: 70.0,  danger: 78.0  },  // Node 1
+  suhu_ruang:  { warn: 70.0,  danger: 78.0  },  // Node 2 (sama threshold)
+  arus:        { warn: 38.0,  danger: 42.7  },  // Node 1
+  getaran:     { warn: 6.0,   danger: 7.3   },  // Node 1
+  gas:         { warn: 250,   danger: 300   },  // Node 2
 };
 
 function getSt(key, val) {
   const t = THR[key];
-  if (!t || val == null) return 'ok';
+  if (!t || val == null || isNaN(val)) return 'ok';
   if (val >= t.danger) return 'crit';
   if (val >= t.warn)   return 'warn';
   return 'ok';
 }
 
-// Waktu terakhir ada data dari masing-masing node (untuk status dot)
-const nodeLastSeen = { n1: 0, n2: 0 };
-const NODE_STALE_MS = 20000; // Anggap offline jika tidak ada data >20 detik
+// ── Node online/offline tracking ───────────────────────────────
+// Menyimpan timestamp Firebase (waktu_lengkap) terakhir per node
+// agar tidak bergantung pada jam browser
+const nodeLastTs = { n1: null, n2: null };
+const NODE_STALE_MS = 30000; // offline jika >30 detik tanpa data baru
 
-window.__sf = { latest: null, hist: [], alarms: [], cN1: null, cN2: null, db };
+window.__sf = { latest: null, hist: [], alarms: [], db };
 
 // ── Firebase Listener ─────────────────────────────────────────
 onValue(ref(db, 'factory_data'), snap => {
@@ -57,38 +62,49 @@ onValue(ref(db, 'factory_data'), snap => {
       for (const jam in raw[tgl]) {
         const e = raw[tgl][jam];
 
-        // Normalisasi timestamp: ganti underscore jam menjadi titik dua
-        // Path key baru: "14_30_05_3872" → tampil sebagai "14:30:05"
         const jamClean = jam.replace(/_(\d{4})$/, '').replace(/_/g, ':');
         const tsStr = e.waktu_lengkap || `${tgl} ${jamClean}`;
+        const timeObj = new Date((tsStr || '').replace(/-/g, '/') || Date.now());
 
         const d = {
           id:       `${tgl}_${jam}`,
           ts:       tsStr,
-          time:     new Date((tsStr || '').replace(/-/g, '/') || Date.now()),
-          getaran:  parseFloat(e.node_machine?.getaran)      || 0,
-          arus:     parseFloat(e.node_machine?.arus)         || 0,
-          suhu_n1:  parseFloat(e.node_machine?.suhu)         || 0,
-          suhu_n2:  parseFloat(e.node_environment?.suhu)     || 0,
-          hum:      parseFloat(e.node_environment?.humidity) || 0,
-          gas:      parseFloat(e.node_environment?.gas)      || 0,
+          time:     timeObj,
+          getaran:  parseFloat(e.node_machine?.getaran)      ?? null,
+          arus:     parseFloat(e.node_machine?.arus)         ?? null,
+          suhu_n1:  parseFloat(e.node_machine?.suhu)         ?? null,
+          suhu_n2:  parseFloat(e.node_environment?.suhu)     ?? null,
+          hum:      parseFloat(e.node_environment?.humidity) ?? null,
+          gas:      parseFloat(e.node_environment?.gas)      ?? null,
           anom_mach:  e.node_machine?.anomali      || false,
           leak_env:   e.node_environment?.kebocoran || false,
-          // Flag ketersediaan data per node
           hasN1: !!e.node_machine,
           hasN2: !!e.node_environment,
         };
 
-        // Tentukan status keseluruhan
+        // Hitung status berdasarkan threshold yang benar
+        // Flag anomali dari hardware ATAU threshold dashboard
+        const machAnom = d.anom_mach
+          || getSt('getaran',    d.getaran) === 'crit'
+          || getSt('arus',       d.arus)    === 'crit'
+          || getSt('suhu_mesin', d.suhu_n1) === 'crit';
+
+        const envAnom = d.leak_env
+          || getSt('gas',       d.gas)     === 'crit'
+          || getSt('suhu_ruang',d.suhu_n2) === 'crit';
+
         let st = 'ok';
-        if (d.anom_mach || d.leak_env) st = 'crit';
-        else if (
-          getSt('suhu', d.suhu_n2) === 'warn' ||
-          getSt('gas',  d.gas)     === 'warn' ||
-          getSt('suhu', d.suhu_n1) === 'warn' ||
-          getSt('getaran', d.getaran) === 'warn' ||
-          getSt('arus', d.arus) === 'warn'
-        ) st = 'warn';
+        if (machAnom || envAnom) {
+          st = 'crit';
+        } else if (
+          getSt('getaran',    d.getaran) === 'warn' ||
+          getSt('arus',       d.arus)    === 'warn' ||
+          getSt('suhu_mesin', d.suhu_n1) === 'warn' ||
+          getSt('suhu_ruang', d.suhu_n2) === 'warn' ||
+          getSt('gas',        d.gas)     === 'warn'
+        ) {
+          st = 'warn';
+        }
         d.status = st;
 
         flat.push(d);
@@ -104,11 +120,14 @@ onValue(ref(db, 'factory_data'), snap => {
   window.__sf.hist   = hist;
   window.__sf.alarms = alarms;
 
+  // Scan seluruh hist untuk cari waktu terakhir masing-masing node
+  // (bukan hanya hist[0], karena bisa jadi record terbaru hanya dari satu node)
+  updateNodeLastSeen(hist);
+
   if (hist.length) {
     window.__sf.latest = hist[0];
     renderDash(hist[0]);
     updateSB(hist[0]);
-    updateNodeLastSeen(hist[0]);
   }
 
   renderLog(hist);
@@ -117,87 +136,83 @@ onValue(ref(db, 'factory_data'), snap => {
 
 }, err => sbState('conn-err', 'KONEKSI GAGAL — ' + err.message));
 
-// Update waktu terakhir node terlihat, lalu refresh dot status
-function updateNodeLastSeen(d) {
-  const now = Date.now();
-  if (d.hasN1) nodeLastSeen.n1 = now;
-  if (d.hasN2) nodeLastSeen.n2 = now;
+// Scan hist, ambil timestamp terbaru yang punya N1 dan yang punya N2
+function updateNodeLastSeen(hist) {
+  let latestN1 = null, latestN2 = null;
+  for (const d of hist) {
+    if (d.hasN1 && latestN1 === null) latestN1 = d.time;
+    if (d.hasN2 && latestN2 === null) latestN2 = d.time;
+    if (latestN1 && latestN2) break; // sudah ketemu keduanya
+  }
+  nodeLastTs.n1 = latestN1;
+  nodeLastTs.n2 = latestN2;
   refreshNodeDots();
 }
 
-// ── Fitur Auto-Toggle Status Online/Offline ───────────────────────────
 function refreshNodeDots() {
-  const latest = window.__sf?.latest;
-  
-  // Jika belum ada data sama sekali di database
-  if (!latest) {
-    dot('dot-n1', 'crit');
-    dot('dot-n2', 'crit');
-    dot('dot-n3', 'crit');
-    return;
-  }
-
   const now = Date.now();
-  // Membandingkan waktu saat ini dengan timestamp data terakhir yang masuk
-  const isStale = (now - latest.time) > NODE_STALE_MS;
 
-  // Set status lingkaran & teks secara dinamis
-  dot('dot-n1', (!isStale && latest.hasN1) ? 'ok' : 'crit');
-  dot('dot-n2', (!isStale && latest.hasN2) ? 'ok' : 'crit');
-  dot('dot-n3', !isStale ? 'ok' : 'crit'); // Node 3 otomatis OFFLINE jika data mandek > 20 detik
+  // Node dianggap online jika ada data dalam NODE_STALE_MS terakhir
+  const n1ok = nodeLastTs.n1 && (now - nodeLastTs.n1.getTime() < NODE_STALE_MS);
+  const n2ok = nodeLastTs.n2 && (now - nodeLastTs.n2.getTime() < NODE_STALE_MS);
+
+  setNodeDot('n1', n1ok ? 'ok' : (nodeLastTs.n1 ? 'crit' : 'crit'));
+  setNodeDot('n2', n2ok ? 'ok' : (nodeLastTs.n2 ? 'crit' : 'crit'));
+  setNodeDot('n3', 'ok'); // Node 3 online selama data masuk Firebase
 }
 
-function dot(id, st) {
-  const el = document.getElementById(id);
-  if (el) el.className = `sdot sd-${st}`;
-  
-  // Update seluruh dot dan teks pendukung di bagian Node Overview
-  const els = document.querySelectorAll(`.sdot-${id}`);
-  els.forEach(e => {
-    e.className = `sdot sd-${st} sdot-${id}`;
-    
-    // PERBAIKAN: Mengubah teks 'Online' / 'Offline' di sebelah lingkaran secara dinamis
-    let nextText = e.nextSibling;
-    if (nextText && nextText.nodeType === Node.TEXT_NODE) {
-      nextText.textContent = st === 'ok' ? 'Online' : 'Offline';
-    }
-  });
+// Update dot di sidebar DAN di node overview card sekaligus
+function setNodeDot(nodeKey, st) {
+  // Sidebar dot
+  const sideEl = document.getElementById(`dot-${nodeKey}`);
+  if (sideEl) sideEl.className = `sdot sd-${st}`;
+
+  // Node overview dot + teks status
+  const overviewDot  = document.getElementById(`ov-dot-${nodeKey}`);
+  const overviewTxt  = document.getElementById(`ov-txt-${nodeKey}`);
+  if (overviewDot) overviewDot.className = `sdot sd-${st}`;
+  if (overviewTxt) {
+    overviewTxt.textContent = st === 'ok' ? 'Online' : 'Offline';
+    overviewTxt.style.color = st === 'ok' ? 'var(--ok-tx)' : 'var(--crit-tx)';
+  }
 }
 
-// Refresh dot setiap 5 detik agar status offline terdeteksi
+// Refresh dot setiap 5 detik agar offline terdeteksi secara periodik
 setInterval(refreshNodeDots, 5000);
 
 // ── Render Dashboard ───────────────────────────────────────────
 function renderDash(d) {
-  setCard('c-getaran', d.getaran, 'mm/s', getSt('getaran', d.getaran));
-  setCard('c-arus',    d.arus,    'A',    getSt('arus',    d.arus));
-  setCard('c-suhu-n1', d.suhu_n1, '°C',  getSt('suhu',    d.suhu_n1));
-  setCard('c-suhu',    d.suhu_n2, '°C',  getSt('suhu',    d.suhu_n2));
-  
-  // PERBAIKAN: Jika d.leak_env bernilai true, otomatis set status card ke 'crit' (ANOMALI)
-  setCard('c-gas',     d.gas,     'ppm', d.leak_env ? 'crit' : getSt('gas', d.gas));
-  setCard('c-hum',     d.hum,     '%',   d.leak_env ? 'crit' : 'ok');
-
-  // Tanda "N/A" jika node tidak mengirim data di record ini
-  if (!d.hasN1) {
-    ['c-getaran','c-arus','c-suhu-n1'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.querySelector('.cv').textContent = 'N/A';
-    });
+  // Render card Node 1 — hanya jika ada data N1 di record ini
+  if (d.hasN1) {
+    setCard('c-getaran', d.getaran, 'mm/s', getSt('getaran',    d.getaran));
+    setCard('c-arus',    d.arus,    'A',    getSt('arus',       d.arus));
+    setCard('c-suhu-n1', d.suhu_n1, '°C',  getSt('suhu_mesin', d.suhu_n1));
+  } else {
+    setCardNA('c-getaran');
+    setCardNA('c-arus');
+    setCardNA('c-suhu-n1');
   }
-  if (!d.hasN2) {
-    ['c-suhu','c-gas','c-hum'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.querySelector('.cv').textContent = 'N/A';
-    });
+
+  // Render card Node 2 — hanya jika ada data N2 di record ini
+  if (d.hasN2) {
+    setCard('c-suhu', d.suhu_n2, '°C',  getSt('suhu_ruang', d.suhu_n2));
+    setCard('c-gas',  d.gas,     'ppm', getSt('gas',        d.gas));
+    setCard('c-hum',  d.hum,     '%',   'ok');
+  } else {
+    setCardNA('c-suhu');
+    setCardNA('c-gas');
+    setCardNA('c-hum');
   }
 
   // Banner alert
   const banner = document.getElementById('banner');
   if (d.status !== 'ok') {
     const msgs = [];
-    if (d.leak_env)  msgs.push('Kebocoran gas terdeteksi — Node 2');
-    if (d.anom_mach) msgs.push('Anomali mesin terdeteksi — Node 1');
+    if (d.leak_env || getSt('gas', d.gas) === 'crit')
+      msgs.push('Kebocoran/Gas berbahaya — Node 2');
+    if (d.anom_mach || getSt('getaran', d.getaran) === 'crit' ||
+        getSt('arus', d.arus) === 'crit' || getSt('suhu_mesin', d.suhu_n1) === 'crit')
+      msgs.push('Anomali mesin terdeteksi — Node 1');
     if (!msgs.length) msgs.push('Parameter sensor mendekati batas bahaya');
     document.getElementById('banner-text').textContent = msgs.join('  ·  ');
     banner.className = `banner bn-${d.status}`;
@@ -206,27 +221,45 @@ function renderDash(d) {
     banner.style.display = 'none';
   }
 
-  document.getElementById('db-id').textContent     = d.id;
-  document.getElementById('db-n1').textContent     = d.hasN1 ? 'Ada' : 'Tidak ada';
-  document.getElementById('db-n2').textContent     = d.hasN2 ? 'Ada' : 'Tidak ada';
-  document.getElementById('db-status').textContent =
-    d.status === 'ok' ? 'NORMAL' : d.status === 'warn' ? 'WARNING' : 'ANOMALI';
-  document.getElementById('db-status').className = `db-val st-${d.status}`;
-  document.getElementById('db-ts').textContent = d.ts;
-  document.getElementById('hdr-ts').textContent = new Date().toLocaleTimeString('id-ID');
+  document.getElementById('db-id').textContent  = d.id;
+  document.getElementById('db-n1').textContent  = d.hasN1 ? 'Ada' : 'Tidak ada';
+  document.getElementById('db-n2').textContent  = d.hasN2 ? 'Ada' : 'Tidak ada';
+  const stLabel = { ok: 'NORMAL', warn: 'WARNING', crit: 'ANOMALI' };
+  document.getElementById('db-status').textContent = stLabel[d.status];
+  document.getElementById('db-status').className   = `db-val st-${d.status}`;
+  document.getElementById('db-ts').textContent     = d.ts;
+  document.getElementById('hdr-ts').textContent    = new Date().toLocaleTimeString('id-ID');
 }
 
+// Set card dengan nilai dan status yang benar
 function setCard(id, val, unit, st) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.querySelector('.cv').textContent = val != null ? parseFloat(val).toFixed(2) : '—';
+  const isNum = val !== null && !isNaN(val);
+  el.querySelector('.cv').textContent = isNum ? parseFloat(val).toFixed(2) : '—';
   el.querySelector('.cu').textContent = unit;
-  const stLabels = { ok: 'NORMAL', warn: 'WARNING', crit: 'ANOMALI' };
   const badge = el.querySelector('.cb');
-  if (badge) { badge.textContent = stLabels[st] || 'NORMAL'; badge.className = `cb st-badge-${st}`; }
+  const stLabels = { ok: 'NORMAL', warn: 'WARNING', crit: 'ANOMALI' };
+  if (badge) {
+    badge.textContent = stLabels[st] || 'NORMAL';
+    badge.className   = `cb st-badge-${st}`;
+  }
   el.className = `kpi-card kc-${st}`;
 }
-  
+
+// Set card ke mode N/A (abu-abu, tanpa status warn/crit)
+function setCardNA(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.querySelector('.cv').textContent = 'N/A';
+  const badge = el.querySelector('.cb');
+  if (badge) {
+    badge.textContent = 'NO DATA';
+    badge.className   = 'cb st-badge-na';
+  }
+  el.className = 'kpi-card kc-na';
+}
+
 // ── Chart Factories ────────────────────────────────────────────
 function baseOpts(yLabel, color, extra = {}) {
   return {
@@ -265,19 +298,16 @@ function mkGetaran(id) {
   const color = '#4F46E5';
   return new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Getaran', data: [], borderColor: color, backgroundColor: color + '22', borderWidth: 2, tension: 0.4, fill: true, pointRadius: 2.5, pointHoverRadius: 5, pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2 }]}, options: baseOpts('mm/s', color) });
 }
-
 function mkArus(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#0891b2';
   return new Chart(ctx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Arus', data: [], backgroundColor: color + '33', borderColor: color, borderWidth: 1.5, borderRadius: 4, borderSkipped: false, hoverBackgroundColor: color + '55' }]}, options: baseOpts('A', color) });
 }
-
 function mkSuhuN1(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#059669';
   return new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Suhu Mesin', data: [], borderColor: color, backgroundColor: color + '18', borderWidth: 2, stepped: 'middle', fill: true, pointRadius: 2, pointHoverRadius: 5, pointBackgroundColor: color, pointBorderColor: '#fff', pointBorderWidth: 1.5 }]}, options: baseOpts('°C', color) });
 }
-
 function mkSuhuN2(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#d97706';
@@ -289,18 +319,17 @@ function mkSuhuN2(id) {
         const g = c.createLinearGradient(0, 0, 0, h);
         g.addColorStop(0, color + '44'); g.addColorStop(1, color + '05'); return g;
       },
-      borderWidth: 2.5, tension: 0.5, fill: true, pointRadius: 0, pointHoverRadius: 5, pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2
+      borderWidth: 2.5, tension: 0.5, fill: true, pointRadius: 0, pointHoverRadius: 5,
+      pointBackgroundColor: '#fff', pointBorderColor: color, pointBorderWidth: 2
     }]},
     options: baseOpts('°C', color)
   });
 }
-
 function mkGas(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#dc2626';
   return new Chart(ctx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Gas/Asap', data: [], backgroundColor: [], borderColor: [], borderWidth: 1.5, borderRadius: 3, borderSkipped: false, hoverBackgroundColor: color + '66' }]}, options: baseOpts('ppm', color) });
 }
-
 function mkHum(id) {
   const ctx = document.getElementById(id); if (!ctx) return null;
   const color = '#7c3aed';
@@ -315,8 +344,6 @@ window.addEventListener('DOMContentLoaded', () => {
   charts.suhuN2  = mkSuhuN2('chart-suhu-n2');
   charts.gas     = mkGas('chart-gas');
   charts.hum     = mkHum('chart-hum');
-  window.__sf.cN1 = charts.getaran;
-  window.__sf.cN2 = charts.suhuN2;
 });
 
 function updateCharts(docs) {
@@ -333,17 +360,17 @@ function updateCharts(docs) {
     c.update('none');
   };
 
-  upd('getaran', d => d.getaran ?? 0);
-  upd('arus',    d => d.arus    ?? 0);
-  upd('suhuN1',  d => d.suhu_n1 ?? 0);
-  upd('suhuN2',  d => d.suhu_n2 ?? 0);
-  upd('hum',     d => d.hum     ?? 0);
+  upd('getaran', d => d.getaran ?? null);
+  upd('arus',    d => d.arus    ?? null);
+  upd('suhuN1',  d => d.suhu_n1 ?? null);
+  upd('suhuN2',  d => d.suhu_n2 ?? null);
+  upd('hum',     d => d.hum     ?? null);
 
   const cGas = charts.gas;
   if (cGas) {
-    const gasVals  = docs.map(d => d.gas ?? 0);
-    const bgColors = gasVals.map(v => v >= 300 ? '#dc262655' : v >= 250 ? '#f59e0b44' : '#dc262620');
-    const bdColors = gasVals.map(v => v >= 300 ? '#dc2626'   : v >= 250 ? '#f59e0b'   : '#dc2626aa');
+    const gasVals  = docs.map(d => d.gas ?? null);
+    const bgColors = gasVals.map(v => v === null ? '#94a3b820' : v >= 300 ? '#dc262655' : v >= 250 ? '#f59e0b44' : '#dc262620');
+    const bdColors = gasVals.map(v => v === null ? '#94a3b8'   : v >= 300 ? '#dc2626'   : v >= 250 ? '#f59e0b'   : '#dc2626aa');
     cGas.data.labels = labels;
     cGas.data.datasets[0].data            = gasVals;
     cGas.data.datasets[0].backgroundColor = bgColors;
@@ -356,16 +383,20 @@ function updateCharts(docs) {
 function renderLog(docs) {
   const tb = document.getElementById('log-tbody');
   if (!tb) return;
-  tb.innerHTML = docs.map(d => `<tr>
-    <td class="mc">${d.ts}</td>
-    <td>${d.hasN1 ? fv(d.getaran,'mm/s') : '<span class="dim">N/A</span>'}</td>
-    <td>${d.hasN1 ? fv(d.arus,'A')       : '<span class="dim">N/A</span>'}</td>
-    <td>${d.hasN1 ? fv(d.suhu_n1,'°C')   : '<span class="dim">N/A</span>'}</td>
-    <td>${d.hasN2 ? fv(d.suhu_n2,'°C')   : '<span class="dim">N/A</span>'}</td>
-    <td>${d.hasN2 ? fv(d.gas,'ppm')       : '<span class="dim">N/A</span>'}</td>
-    <td>${d.hasN2 ? fv(d.hum,'%')         : '<span class="dim">N/A</span>'}</td>
-    <td><span class="lpill lp-${d.status}">${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'}</span></td>
-  </tr>`).join('');
+  tb.innerHTML = docs.map(d => {
+    // Warna baris berdasarkan status
+    const rowCls = d.status === 'crit' ? 'row-crit' : d.status === 'warn' ? 'row-warn' : '';
+    return `<tr class="${rowCls}">
+      <td class="mc">${d.ts}</td>
+      <td>${d.hasN1 && d.getaran !== null ? fv(d.getaran,'mm/s', getSt('getaran',d.getaran))    : na()}</td>
+      <td>${d.hasN1 && d.arus    !== null ? fv(d.arus,   'A',    getSt('arus',d.arus))           : na()}</td>
+      <td>${d.hasN1 && d.suhu_n1 !== null ? fv(d.suhu_n1,'°C',  getSt('suhu_mesin',d.suhu_n1)) : na()}</td>
+      <td>${d.hasN2 && d.suhu_n2 !== null ? fv(d.suhu_n2,'°C',  getSt('suhu_ruang',d.suhu_n2)) : na()}</td>
+      <td>${d.hasN2 && d.gas     !== null ? fv(d.gas,    'ppm', getSt('gas',d.gas))              : na()}</td>
+      <td>${d.hasN2 && d.hum     !== null ? fv(d.hum,    '%',   'ok')                            : na()}</td>
+      <td><span class="lpill lp-${d.status}">${d.status==='ok'?'NORMAL':d.status==='warn'?'WARNING':'ANOMALI'}</span></td>
+    </tr>`;
+  }).join('');
   document.getElementById('log-count').textContent = docs.length + ' entri';
 }
 
@@ -378,21 +409,38 @@ function renderAlarms(docs) {
   document.getElementById('s-crit').textContent  = nc;
   document.getElementById('s-warn').textContent  = nw;
   document.getElementById('s-total').textContent = docs.length;
+
+  // Badge di sidebar — fix: pakai display block/none bukan inline-flex
   const nb = document.getElementById('alarm-badge');
-  if (nb) { nb.textContent = docs.length; nb.style.display = docs.length ? 'inline-flex' : 'none'; }
+  if (nb) {
+    nb.textContent    = docs.length;
+    nb.style.display  = docs.length ? 'inline-flex' : 'none';
+  }
+
   if (!docs.length) {
     el.innerHTML = `<div class="empty-st"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg><p>Semua sistem berjalan normal</p></div>`;
     return;
   }
   el.innerHTML = docs.map(d => {
     const tg = [];
-    if (d.leak_env)   tg.push('Kebocoran Gas');
-    if (d.anom_mach)  tg.push('Anomali Mesin');
-    if (d.suhu_n2 > 38) tg.push(`Suhu Ruang ${parseFloat(d.suhu_n2).toFixed(1)}°C`);
-    if (d.suhu_n1 > 38) tg.push(`Suhu Mesin ${parseFloat(d.suhu_n1).toFixed(1)}°C`);
-    if (d.gas > 250) tg.push(`Gas ${parseFloat(d.gas).toFixed(0)} ppm`);
-    if (d.getaran > 2.0) tg.push(`Getaran ${parseFloat(d.getaran).toFixed(2)} mm/s`);
-    if (d.arus > 4.0) tg.push(`Arus ${parseFloat(d.arus).toFixed(2)} A`);
+    if (d.leak_env || getSt('gas', d.gas) === 'crit')
+      tg.push(`Gas ${d.gas !== null ? parseFloat(d.gas).toFixed(0) + ' ppm' : ''}`.trim());
+    if (d.anom_mach || getSt('getaran', d.getaran) === 'crit')
+      tg.push(`Getaran ${d.getaran !== null ? parseFloat(d.getaran).toFixed(2) + ' mm/s' : ''}`.trim());
+    if (getSt('arus', d.arus) === 'crit')
+      tg.push(`Arus ${d.arus !== null ? parseFloat(d.arus).toFixed(2) + ' A' : ''}`.trim());
+    if (getSt('suhu_mesin', d.suhu_n1) === 'crit')
+      tg.push(`Suhu Mesin ${d.suhu_n1 !== null ? parseFloat(d.suhu_n1).toFixed(1) + '°C' : ''}`.trim());
+    if (getSt('suhu_ruang', d.suhu_n2) === 'crit')
+      tg.push(`Suhu Ruang ${d.suhu_n2 !== null ? parseFloat(d.suhu_n2).toFixed(1) + '°C' : ''}`.trim());
+    // Warning tags
+    if (!tg.length) {
+      if (getSt('gas',        d.gas)     === 'warn') tg.push(`Gas ${parseFloat(d.gas).toFixed(0)} ppm`);
+      if (getSt('getaran',    d.getaran) === 'warn') tg.push(`Getaran ${parseFloat(d.getaran).toFixed(2)} mm/s`);
+      if (getSt('arus',       d.arus)    === 'warn') tg.push(`Arus ${parseFloat(d.arus).toFixed(2)} A`);
+      if (getSt('suhu_mesin', d.suhu_n1) === 'warn') tg.push(`Suhu Mesin ${parseFloat(d.suhu_n1).toFixed(1)}°C`);
+      if (getSt('suhu_ruang', d.suhu_n2) === 'warn') tg.push(`Suhu Ruang ${parseFloat(d.suhu_n2).toFixed(1)}°C`);
+    }
     return `<div class="alarm-row ar-${d.status}">
       <div class="ar-left">
         <span class="ar-badge arb-${d.status}">${d.status === 'crit' ? 'ANOMALI' : 'WARNING'}</span>
@@ -413,23 +461,20 @@ function sbState(st, msg) {
   if (txt) txt.textContent = msg;
 }
 
-// ── Test Insert (Preset & Custom) ─────────────────────────────
+// ── Test Insert ────────────────────────────────────────────────
 const PRESETS = [
-  { label: 'Normal',       data: { getaran: 1.8, arus: 3.2, suhu_m: 35, suhu_e: 28, hum: 72, gas: 180, am: false, ke: false } },
-  { label: 'Warning Suhu', data: { getaran: 2.1, arus: 3.5, suhu_m: 40, suhu_e: 32, hum: 65, gas: 260, am: false, ke: false } },
-  { label: 'Anomali Gas',  data: { getaran: 2.4, arus: 3.7, suhu_m: 41, suhu_e: 33, hum: 68, gas: 318, am: false, ke: true  } },
-  { label: 'Full Anomali', data: { getaran: 3.5, arus: 5.2, suhu_m: 50, suhu_e: 38, hum: 90, gas: 420, am: true,  ke: true  } },
+  { label: 'Normal',       data: { getaran: 4.0,  arus: 25.0, suhu_m: 55, suhu_e: 50, hum: 72, gas: 180, am: false, ke: false } },
+  { label: 'Warning',      data: { getaran: 6.2,  arus: 39.0, suhu_m: 71, suhu_e: 71, hum: 65, gas: 260, am: false, ke: false } },
+  { label: 'Anomali Gas',  data: { getaran: 5.0,  arus: 30.0, suhu_m: 60, suhu_e: 55, hum: 68, gas: 318, am: false, ke: true  } },
+  { label: 'Full Anomali', data: { getaran: 7.5,  arus: 43.5, suhu_m: 80, suhu_e: 79, hum: 90, gas: 420, am: true,  ke: true  } },
 ];
 
-// Path key sama persis dengan Node 3: tanggal/jam_menit_detik_millis4digit
 function pathNow() {
   const n   = new Date();
   const tgl = n.toISOString().split('T')[0];
   const hms = n.toTimeString().split(' ')[0].replace(/:/g, '_');
   const ms4 = String(n.getTime() % 10000).padStart(4, '0');
-  const key = `${hms}_${ms4}`;
-  const full= `${tgl} ${n.toTimeString().split(' ')[0]}`;
-  return { tgl, key, full };
+  return { tgl, key: `${hms}_${ms4}`, full: `${tgl} ${n.toTimeString().split(' ')[0]}` };
 }
 
 window.sendPreset = async (i) => {
@@ -445,17 +490,11 @@ window.sendPreset = async (i) => {
 };
 
 window.sendCustom = async () => {
-  // Ambil nilai dari kedua input suhu (N1 & N2)
-  const g   = id => parseFloat(document.getElementById(id)?.value || '0');
-  const t   = pathNow();
-  const gas = g('i-gas');
-  const suhu_m = g('i-suhu-m');   // Suhu Mesin (Node 1)
-  const suhu_e = g('i-suhu-e');   // Suhu Ruang (Node 2)
-  const getaran = g('i-getaran');
-  const arus    = g('i-arus');
-  const hum     = g('i-hum');
-  // Tentukan anomali otomatis dari threshold
-  const am = getaran >= 3.0 || arus >= 5.0 || suhu_m >= 42;
+  const g = id => parseFloat(document.getElementById(id)?.value || '0');
+  const t = pathNow();
+  const gas = g('i-gas'), suhu_m = g('i-suhu-m'), suhu_e = g('i-suhu-e');
+  const getaran = g('i-getaran'), arus = g('i-arus'), hum = g('i-hum');
+  const am = getaran >= 7.3 || arus >= 42.7 || suhu_m >= 78;
   const ke = gas >= 300;
   try {
     await set(ref(db, `factory_data/${t.tgl}/${t.key}`), {
@@ -468,10 +507,14 @@ window.sendCustom = async () => {
 };
 
 // ── Helper ─────────────────────────────────────────────────────
-function fv(v, u) {
-  if (v == null) return `<span class="dim">—</span>`;
-  return `<span class="dn">${parseFloat(v).toFixed(2)}</span><span class="du"> ${u}</span>`;
+// fv: format nilai dengan warna berdasarkan status
+function fv(v, u, st) {
+  if (v == null || isNaN(v)) return na();
+  const color = st === 'crit' ? 'var(--crit-tx)' : st === 'warn' ? 'var(--warn-tx)' : 'var(--t1)';
+  return `<span class="dn" style="color:${color}">${parseFloat(v).toFixed(2)}</span><span class="du"> ${u}</span>`;
 }
+function na() { return `<span class="dim">N/A</span>`; }
+
 function toast(msg, err = false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -490,10 +533,8 @@ function toast(msg, err = false) {
   --bg-s:     #FFFFFF;
   --bg-c:     #FFFFFF;
   --bg-h:     #F1F0EE;
-  --surface:  #FFFFFF;
   --b1:       #E8E5E0;
   --b2:       #D4D0CA;
-  --b3:       #C0BCB5;
   --t1:       #1C1917;
   --t2:       #44403C;
   --t3:       #78716C;
@@ -511,6 +552,9 @@ function toast(msg, err = false) {
   --crit-tx:  #DC2626;
   --crit-bg:  #FEF2F2;
   --crit-br:  #FECACA;
+  --na-tx:    #A8A29E;
+  --na-bg:    #F8F7F5;
+  --na-br:    #E8E5E0;
   --font: 'Inter', system-ui, sans-serif;
   --mono: 'JetBrains Mono', monospace;
   --nav-w:     240px;
@@ -523,25 +567,18 @@ function toast(msg, err = false) {
   --shadow-lg: 0 8px 24px rgba(0,0,0,.10),0 2px 6px rgba(0,0,0,.05);
 }
 
-html { font-size: 14px; }
-body {
-  font-family: var(--font);
-  background: var(--bg);
-  color: var(--t1);
-  min-height: 100vh;
-  overflow-x: hidden;
-  -webkit-font-smoothing: antialiased;
-}
+html{font-size:14px}
+body{font-family:var(--font);background:var(--bg);color:var(--t1);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--b2);border-radius:9px}
 
 /* STATUS BAR */
 .sb{position:sticky;top:0;z-index:300;height:var(--sbh);display:flex;align-items:center;gap:8px;padding:0 20px;font-family:var(--mono);font-size:9px;letter-spacing:1.2px;border-bottom:1px solid var(--b1);background:var(--bg-s);box-shadow:var(--shadow-sm);transition:background .3s,color .3s}
-.sb-ok       {color:var(--ok-tx);border-bottom-color:var(--ok-br)}
-.sb-warn     {color:var(--warn-tx);border-bottom-color:var(--warn-br);background:var(--warn-bg)}
-.sb-crit     {color:var(--crit-tx);border-bottom-color:var(--crit-br);background:var(--crit-bg);animation:bk .7s infinite}
-.sb-conn-err {color:var(--crit-tx);border-bottom-color:var(--crit-br)}
+.sb-ok      {color:var(--ok-tx);border-bottom-color:var(--ok-br)}
+.sb-warn    {color:var(--warn-tx);border-bottom-color:var(--warn-br);background:var(--warn-bg)}
+.sb-crit    {color:var(--crit-tx);border-bottom-color:var(--crit-br);background:var(--crit-bg);animation:bk .7s infinite}
+.sb-conn-err{color:var(--crit-tx);border-bottom-color:var(--crit-br)}
 .sb-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0;animation:pd 1.8s ease-in-out infinite}
 @keyframes pd{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.7);opacity:.5}}
 @keyframes bk{0%,100%{opacity:1}50%{opacity:.4}}
@@ -575,12 +612,16 @@ body {
 .side.collapsed .nb.on{border-left-color:transparent}
 .side.collapsed .nb::after{content:attr(data-tip);position:absolute;left:calc(var(--nav-w-col) + 6px);top:50%;transform:translateY(-50%);background:var(--t1);color:#fff;font-size:11px;padding:4px 9px;border-radius:5px;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .15s;z-index:99}
 .side.collapsed .nb:hover::after{opacity:1}
+
+/* Fix: badge alarm tampil saat sidebar tidak collapsed */
 .n-badge{display:none;margin-left:auto;background:var(--crit-bg);color:var(--crit-tx);border:1px solid var(--crit-br);font-size:9px;font-family:var(--mono);padding:1px 6px;border-radius:20px;font-weight:600}
+.side:not(.collapsed) .nb .n-badge{display:inline-flex}
 .side.collapsed .n-badge{display:none!important}
+
 .side-nodes{padding:8px 14px}
 .side.collapsed .side-nodes{display:none}
 .sn-row{display:flex;align-items:center;gap:8px;padding:5px 0}
-.sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:background .3s,box-shadow .3s}
 .sd-ok  {background:var(--ok-tx);box-shadow:0 0 6px rgba(5,150,105,.3);animation:pd 2.2s ease-in-out infinite}
 .sd-crit{background:var(--crit-tx);box-shadow:0 0 6px rgba(220,38,38,.4);animation:bk .6s infinite}
 .sn-name{font-size:11px;color:var(--t2)}
@@ -621,7 +662,7 @@ body {
 
 /* KPI CARDS */
 .kpi-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:8px}
-.kpi-card{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:16px;box-shadow:var(--shadow-sm);transition:border-color .2s,box-shadow .2s;position:relative;overflow:hidden}
+.kpi-card{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:16px;box-shadow:var(--shadow-sm);transition:border-color .2s,box-shadow .2s,background .2s;position:relative;overflow:hidden}
 .kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--b1);transition:background .2s}
 .kpi-card:hover{border-color:var(--b2);box-shadow:var(--shadow)}
 .kc-ok::before  {background:var(--ok-tx)}
@@ -629,6 +670,8 @@ body {
 .kc-warn::before{background:var(--warn-tx)}
 .kc-crit        {background:var(--crit-bg);border-color:var(--crit-br)}
 .kc-crit::before{background:var(--crit-tx)}
+.kc-na          {background:var(--na-bg);border-color:var(--na-br);opacity:.7}
+.kc-na::before  {background:var(--na-br)}
 .kpi-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
 .kpi-label{font-size:11px;color:var(--t3);letter-spacing:.1px;display:flex;align-items:center;gap:5px}
 .kpi-label svg{opacity:.6}
@@ -636,9 +679,11 @@ body {
 .st-badge-ok  {background:var(--ok-bg);  color:var(--ok-tx);  border:1px solid var(--ok-br)}
 .st-badge-warn{background:var(--warn-bg);color:var(--warn-tx);border:1px solid var(--warn-br)}
 .st-badge-crit{background:var(--crit-bg);color:var(--crit-tx);border:1px solid var(--crit-br)}
+.st-badge-na  {background:var(--na-bg);  color:var(--na-tx);  border:1px solid var(--na-br)}
 .cv{font-size:28px;font-weight:700;line-height:1;letter-spacing:-1.5px;color:var(--t1)}
 .kc-warn .cv{color:var(--warn-tx)}
 .kc-crit .cv{color:var(--crit-tx)}
+.kc-na   .cv{color:var(--na-tx);font-size:20px;letter-spacing:0}
 .cu{font-size:11px;color:var(--t3);margin-left:3px;font-weight:400}
 
 /* CHARTS */
@@ -675,7 +720,7 @@ body {
 .nc-body{flex:1;min-width:0}
 .nc-name{font-size:12px;font-weight:500;color:var(--t1)}
 .nc-desc{font-size:10px;color:var(--t3);margin-top:2px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.nc-st{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--t3)}
+.nc-st{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--t3);white-space:nowrap}
 
 /* DB STRIP */
 .db-strip{display:flex;flex-wrap:wrap;background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);padding:12px 16px;margin-top:12px;gap:0;box-shadow:var(--shadow-sm)}
@@ -695,8 +740,12 @@ th{background:var(--bg-h);color:var(--t4);font-weight:600;font-size:9px;letter-s
 td{padding:10px 14px;border-bottom:1px solid var(--b1);color:var(--t2);vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:var(--bg-h)}
+tr.row-crit td{background:var(--crit-bg)}
+tr.row-warn td{background:var(--warn-bg)}
+tr.row-crit:hover td{background:#fecaca55}
+tr.row-warn:hover td{background:#fde68a55}
 .mc {font-family:var(--mono);font-size:10px;color:var(--t3);white-space:nowrap}
-.dn {color:var(--t1);font-weight:500}
+.dn {font-weight:500}
 .du {font-size:10px;color:var(--t4)}
 .dim{color:var(--t4)}
 .lpill{font-size:9px;padding:2px 8px;border-radius:20px;font-weight:600;letter-spacing:.4px;font-family:var(--mono)}
@@ -737,10 +786,8 @@ tr:hover td{background:var(--bg-h)}
 .pb-1{border-top:2px solid var(--warn-tx)}.pb-1 .pb-l{color:var(--warn-tx)}
 .pb-2{border-top:2px solid var(--crit-tx)}.pb-2 .pb-l{color:var(--crit-tx)}
 .pb-3{border-top:2px solid var(--crit-tx)}.pb-3 .pb-l{color:var(--crit-tx)}
-
-/* INPUT SECTION */
 .input-section-label{font-size:9px;color:var(--t4);letter-spacing:1.2px;text-transform:uppercase;font-weight:600;padding:14px 18px 8px;border-top:1px solid var(--b1)}
-.input-section-label:first-child{border-top:none;padding-top:0}
+.input-section-label:first-child{border-top:none;padding-top:16px}
 .input-block{background:var(--bg-c);border:1px solid var(--b1);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow-sm)}
 .ir{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--b1)}
 .ir:last-of-type{border-bottom:none}
@@ -748,7 +795,7 @@ tr:hover td{background:var(--bg-h)}
 .ir-u{font-size:10px;color:var(--t4);font-weight:400}
 .inp{width:120px;background:var(--bg);border:1px solid var(--b2);border-radius:var(--r-sm);color:var(--t1);font-size:13px;padding:7px 11px;text-align:right;font-family:var(--mono);outline:none;transition:border-color .12s,box-shadow .12s}
 .inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-.send-btn{width:100%;margin-top:0;background:var(--accent);border:none;border-radius:0 0 var(--r) var(--r);color:#fff;font-size:13px;font-weight:500;padding:12px;cursor:pointer;font-family:var(--font);transition:background .12s,transform .1s;display:block}
+.send-btn{width:100%;background:var(--accent);border:none;border-radius:0 0 var(--r) var(--r);color:#fff;font-size:13px;font-weight:500;padding:12px;cursor:pointer;font-family:var(--font);transition:background .12s;display:block}
 .send-btn:hover{background:var(--accent-h)}
 
 /* TOAST */
@@ -761,7 +808,6 @@ tr:hover td{background:var(--bg-h)}
 </head>
 <body>
 
-<!-- STATUS BAR -->
 <div class="sb sb-ok" id="sb">
   <span class="sb-dot"></span>
   <span id="sb-txt">MENGHUBUNGKAN KE REALTIME DATABASE...</span>
@@ -769,7 +815,6 @@ tr:hover td{background:var(--bg-h)}
 
 <div class="shell">
 
-<!-- SIDEBAR -->
 <nav class="side" id="sidebar">
   <div class="side-brand">
     <div class="brand-sq">
@@ -779,7 +824,7 @@ tr:hover td{background:var(--bg-h)}
       <div class="brand-name">SmartFactory</div>
       <div class="brand-id">Telemetry Platform</div>
     </div>
-    <button class="side-toggle" onclick="toggleSidebar()" title="Toggle sidebar">
+    <button class="side-toggle" onclick="toggleSidebar()">
       <svg class="toggle-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>
     </button>
   </div>
@@ -801,7 +846,7 @@ tr:hover td{background:var(--bg-h)}
     <button class="nb" onclick="nav('alarm')" data-tip="Alarm Center">
       <svg class="nb-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1a5 5 0 0 1 5 5v3l1 2H2l1-2V6a5 5 0 0 1 5-5zM6.5 13a1.5 1.5 0 0 0 3 0"/></svg>
       <span class="nb-txt">Alarm Center</span>
-      <span class="n-badge" id="alarm-badge">0</span>
+      <span class="n-badge" id="alarm-badge" style="display:none">0</span>
     </button>
   </div>
 
@@ -829,7 +874,6 @@ tr:hover td{background:var(--bg-h)}
   </div>
 </nav>
 
-<!-- MAIN -->
 <main class="main">
 
   <!-- DASHBOARD -->
@@ -850,7 +894,6 @@ tr:hover td{background:var(--bg-h)}
       <span id="banner-text"></span>
     </div>
 
-    <!-- NODE 1 -->
     <div class="sh">
       <span class="node-tag nt-1">Node 1</span>
       <span class="sh-label">Machine Monitoring · ESP32 #1</span>
@@ -880,7 +923,6 @@ tr:hover td{background:var(--bg-h)}
       </div>
     </div>
 
-    <!-- NODE 2 -->
     <div class="sh">
       <span class="node-tag nt-2">Node 2</span>
       <span class="sh-label">Environment Monitoring · ESP32 #2</span>
@@ -910,13 +952,12 @@ tr:hover td{background:var(--bg-h)}
       </div>
     </div>
 
-    <!-- CHARTS -->
     <div class="sh"><span class="sh-label">Trend Charts — Per Parameter</span><div class="sh-line"></div></div>
     <div class="chart-grid">
       <div class="chart-box ch-getaran">
         <div class="cb-head">
           <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2"><path d="M2 12h2M5 6l1.5 2M5 18l1.5-2M12 2v2M12 20v2M19 6l-1.5 2M19 18l-1.5-2M22 12h-2"/><circle cx="12" cy="12" r="4"/></svg></div>
-          <div class="cb-info"><div class="cb-title">Getaran</div><div class="cb-sub">Node 1 · mm/s</div></div>
+          <div class="cb-info"><div class="cb-title">Getaran</div><div class="cb-sub">Node 1 · mm/s · anomali ≥7.3</div></div>
           <span class="cb-type">Area</span>
         </div>
         <div class="cw"><canvas id="chart-getaran"></canvas></div>
@@ -924,7 +965,7 @@ tr:hover td{background:var(--bg-h)}
       <div class="chart-box ch-arus">
         <div class="cb-head">
           <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#0891b2" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
-          <div class="cb-info"><div class="cb-title">Arus Listrik</div><div class="cb-sub">Node 1 · Ampere</div></div>
+          <div class="cb-info"><div class="cb-title">Arus Listrik</div><div class="cb-sub">Node 1 · A · anomali ≥42.7</div></div>
           <span class="cb-type">Bar</span>
         </div>
         <div class="cw"><canvas id="chart-arus"></canvas></div>
@@ -932,7 +973,7 @@ tr:hover td{background:var(--bg-h)}
       <div class="chart-box ch-suhu-n1">
         <div class="cb-head">
           <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
-          <div class="cb-info"><div class="cb-title">Suhu Mesin</div><div class="cb-sub">Node 1 · °C</div></div>
+          <div class="cb-info"><div class="cb-title">Suhu Mesin</div><div class="cb-sub">Node 1 · °C · anomali ≥78</div></div>
           <span class="cb-type">Step</span>
         </div>
         <div class="cw"><canvas id="chart-suhu-n1"></canvas></div>
@@ -940,7 +981,7 @@ tr:hover td{background:var(--bg-h)}
       <div class="chart-box ch-suhu-n2">
         <div class="cb-head">
           <div class="cb-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
-          <div class="cb-info"><div class="cb-title">Suhu Ruang</div><div class="cb-sub">Node 2 · °C</div></div>
+          <div class="cb-info"><div class="cb-title">Suhu Ruang</div><div class="cb-sub">Node 2 · °C · anomali ≥78</div></div>
           <span class="cb-type">Gradient</span>
         </div>
         <div class="cw"><canvas id="chart-suhu-n2"></canvas></div>
@@ -952,7 +993,7 @@ tr:hover td{background:var(--bg-h)}
           <span class="cb-type">Threshold</span>
         </div>
         <div class="cw"><canvas id="chart-gas"></canvas></div>
-        <div class="cf">Bar merah = Anomali &nbsp;·&nbsp; Kuning = Warning</div>
+        <div class="cf">Merah ≥300 ppm · Kuning ≥250 ppm</div>
       </div>
       <div class="chart-box ch-hum">
         <div class="cb-head">
@@ -964,27 +1005,34 @@ tr:hover td{background:var(--bg-h)}
       </div>
     </div>
 
-    <!-- NODE OVERVIEW -->
     <div class="sh"><span class="sh-label">Node Overview</span><div class="sh-line"></div></div>
     <div class="node-row">
       <div class="node-c">
         <div class="nc-ico ni-1"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#4F46E5" stroke="none"/></svg></div>
         <div class="nc-body"><div class="nc-name">ESP32 Node 1</div><div class="nc-desc">Machine · MQTT → factoryesp1in</div></div>
-        <div class="nc-st"><span class="sdot sd-ok sdot-dot-n1" style="width:6px;height:6px"></span>Online</div>
+        <div class="nc-st">
+          <span class="sdot sd-ok" id="ov-dot-n1" style="width:6px;height:6px"></span>
+          <span id="ov-txt-n1">Online</span>
+        </div>
       </div>
       <div class="node-c">
         <div class="nc-ico ni-2"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="#D97706" stroke="none"/></svg></div>
         <div class="nc-body"><div class="nc-name">ESP32 Node 2</div><div class="nc-desc">Environment · MQTT → factoryesp2in</div></div>
-        <div class="nc-st"><span class="sdot sd-ok sdot-dot-n2" style="width:6px;height:6px"></span>Online</div>
+        <div class="nc-st">
+          <span class="sdot sd-ok" id="ov-dot-n2" style="width:6px;height:6px"></span>
+          <span id="ov-txt-n2">Online</span>
+        </div>
       </div>
       <div class="node-c">
         <div class="nc-ico ni-3"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
         <div class="nc-body"><div class="nc-name">ESP32 Node 3</div><div class="nc-desc">Gateway → Realtime Database</div></div>
-        <div class="nc-st"><span class="sdot sd-ok" style="width:6px;height:6px"></span>Online</div>
+        <div class="nc-st">
+          <span class="sdot sd-ok" id="ov-dot-n3" style="width:6px;height:6px"></span>
+          <span id="ov-txt-n3">Online</span>
+        </div>
       </div>
     </div>
 
-    <!-- DB STRIP -->
     <div class="db-strip">
       <div class="db-field"><div class="db-lbl">Node Path</div><div class="db-val">factory_data</div></div>
       <div class="db-field"><div class="db-lbl">Record ID</div><div class="db-val" id="db-id">—</div></div>
@@ -993,7 +1041,7 @@ tr:hover td{background:var(--bg-h)}
       <div class="db-field"><div class="db-lbl">Status</div><div class="db-val st-ok" id="db-status">—</div></div>
       <div class="db-field"><div class="db-lbl">Waktu Tercatat</div><div class="db-val" id="db-ts">—</div></div>
     </div>
-  </div><!-- /dashboard -->
+  </div>
 
   <!-- LOG -->
   <div class="pg" id="pg-log">
@@ -1031,29 +1079,26 @@ tr:hover td{background:var(--bg-h)}
   <div class="pg" id="pg-test">
     <div class="ph"><div><div class="ph-title">Test Insert</div><div class="ph-sub">Simulasi injeksi data ke Realtime Database</div></div></div>
     <div class="test-info">
-      Tombol ini menulis data dummy ke path <code>factory_data/{tanggal}/{jam_menit_detik_ms}</code>.<br>
-      Format key sama persis dengan Node 3, sehingga tidak akan bentrok dengan data hardware.<br>
-      Anomali dan kebocoran ditentukan <b>otomatis</b> dari threshold (Getaran ≥3.0, Arus ≥5.0, Suhu ≥42°C, Gas ≥300 ppm).
+      Menulis ke path <code>factory_data/{tanggal}/{jam_menit_detik_ms}</code> — format sama dengan Node 3.<br>
+      Threshold anomali: Getaran ≥<b>7.3 mm/s</b>, Arus ≥<b>42.7 A</b>, Suhu ≥<b>78°C</b>, Gas ≥<b>300 ppm</b>.
     </div>
     <div class="sh"><span class="sh-label">Preset Cepat</span><div class="sh-line"></div></div>
     <div class="preset-grid">
-      <button class="preset-btn pb-0" onclick="sendPreset(0)"><div class="pb-l">Normal</div><div class="pb-d">Gas 180ppm · Suhu 35°C</div></button>
-      <button class="preset-btn pb-1" onclick="sendPreset(1)"><div class="pb-l">Warning Suhu</div><div class="pb-d">Gas 260ppm · Suhu 40°C</div></button>
-      <button class="preset-btn pb-2" onclick="sendPreset(2)"><div class="pb-l">Anomali Gas</div><div class="pb-d">Gas 318ppm · Kebocoran</div></button>
-      <button class="preset-btn pb-3" onclick="sendPreset(3)"><div class="pb-l">Full Anomali</div><div class="pb-d">Gas 420ppm · Suhu 50°C</div></button>
+      <button class="preset-btn pb-0" onclick="sendPreset(0)"><div class="pb-l">Normal</div><div class="pb-d">Gas 180ppm · Getaran 4.0mm/s</div></button>
+      <button class="preset-btn pb-1" onclick="sendPreset(1)"><div class="pb-l">Warning</div><div class="pb-d">Gas 260ppm · Arus 39A · Suhu 71°C</div></button>
+      <button class="preset-btn pb-2" onclick="sendPreset(2)"><div class="pb-l">Anomali Gas</div><div class="pb-d">Gas 318ppm · Kebocoran aktif</div></button>
+      <button class="preset-btn pb-3" onclick="sendPreset(3)"><div class="pb-l">Full Anomali</div><div class="pb-d">Gas 420ppm · Arus 43.5A · Suhu 80°C</div></button>
     </div>
     <div class="sh"><span class="sh-label">Input Manual</span><div class="sh-line"></div></div>
     <div class="input-block">
-      <!-- Node 1 group -->
       <div class="input-section-label">Node 1 — Machine</div>
-      <div class="ir"><span class="ir-l">Getaran <span class="ir-u">(mm/s)</span></span><input class="inp" id="i-getaran" type="number" value="2.0" step="0.1" min="0"/></div>
-      <div class="ir"><span class="ir-l">Arus <span class="ir-u">(A)</span></span><input class="inp" id="i-arus" type="number" value="3.5" step="0.1" min="0"/></div>
-      <div class="ir"><span class="ir-l">Suhu Mesin <span class="ir-u">(°C)</span></span><input class="inp" id="i-suhu-m" type="number" value="37" min="0"/></div>
-      <!-- Node 2 group -->
+      <div class="ir"><span class="ir-l">Getaran <span class="ir-u">(mm/s · anomali ≥7.3)</span></span><input class="inp" id="i-getaran" type="number" value="4.0" step="0.1" min="0"/></div>
+      <div class="ir"><span class="ir-l">Arus <span class="ir-u">(A · anomali ≥42.7)</span></span><input class="inp" id="i-arus" type="number" value="25.0" step="0.1" min="0"/></div>
+      <div class="ir"><span class="ir-l">Suhu Mesin <span class="ir-u">(°C · anomali ≥78)</span></span><input class="inp" id="i-suhu-m" type="number" value="55" min="0"/></div>
       <div class="input-section-label">Node 2 — Environment</div>
-      <div class="ir"><span class="ir-l">Suhu Ruang <span class="ir-u">(°C)</span></span><input class="inp" id="i-suhu-e" type="number" value="29" min="0"/></div>
+      <div class="ir"><span class="ir-l">Suhu Ruang <span class="ir-u">(°C · anomali ≥78)</span></span><input class="inp" id="i-suhu-e" type="number" value="50" min="0"/></div>
       <div class="ir"><span class="ir-l">Kelembaban <span class="ir-u">(%)</span></span><input class="inp" id="i-hum" type="number" value="70" min="0" max="100"/></div>
-      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(ppm)</span></span><input class="inp" id="i-gas" type="number" value="200" min="0"/></div>
+      <div class="ir"><span class="ir-l">Gas / Asap <span class="ir-u">(ppm · anomali ≥300)</span></span><input class="inp" id="i-gas" type="number" value="200" min="0"/></div>
       <button class="send-btn" onclick="sendCustom()">Kirim ke Database</button>
     </div>
   </div>

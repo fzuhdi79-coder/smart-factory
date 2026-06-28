@@ -276,3 +276,7 @@ smart-factory/
 - Node 3 hanya mengupload ke Firebase jika ada data baru dari minimal satu node (tidak upload saat idle).
 - Threshold gas pada dashboard sebelumnya salah menggunakan skala 250–300, padahal firmware memetakan nilai ke 0–100. Sudah dikoreksi.
 - Firebase menggunakan metode `PUT` (bukan `POST`) sehingga path key harus unik — digunakan format `HH_MM_SS_millis4digit`.
+
+---
+
+*Developed with ❤️ by [Zudi Jago/ fzuhdi79-coder]*
